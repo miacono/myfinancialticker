@@ -93,7 +93,7 @@ def get_performance():
     d_icon = "▲" if daily_net >= 0 else "▼"
     y_icon = "▲" if ytd_net >= 0 else "▼"
 
-    return f"D: {d_icon}{daily_perc:.2f}% ({daily_net:+.2f}€) | Y: {y_icon}{ytd_perc:.2f}% ({ytd_net:+.2f}€) | T: {t_icon}{total_perc:.2f}% ({total_net:.2f}€)"
+    return f"D: {d_icon} {daily_perc:.2f}% ({daily_net:+.2f}€) | Y: {y_icon} {ytd_perc:.2f}% ({ytd_net:+.2f}€) | T: {t_icon} {total_perc:.2f}% ({total_net:.2f}€)"
 
 if __name__ == "__main__":
     try:
