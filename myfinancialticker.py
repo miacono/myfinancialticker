@@ -4,6 +4,7 @@ import warnings
 import json
 import sys
 import os
+import math
 from datetime import date, timedelta
 
 warnings.filterwarnings("ignore")
@@ -52,7 +53,11 @@ def get_performance():
             qty, cost = data # Unpack quantity and cost from the list
 
             current_price = info['last_price']
-            prev_close = info['regular_market_previous_close']
+            
+            if math.isnan(info['regular_market_previous_close']):
+                prev_close = info['previous_close']
+            else:
+                prev_close = info['regular_market_previous_close']
 
             # Get historical data to find the closing price at the start of the year
             # We look for the data from the last day of the previous year, going back up to 7 days to find a trading day.
