@@ -26,6 +26,19 @@ def load_portfolio(filename="portfolio.json"):
     except json.JSONDecodeError:
         sys.exit(f"Error: The file '{config_path}' is not a valid JSON.")
 
+def _closing_price_on_or_before(hist, target_date, fallback):
+    """Return the last closing price in `hist` on or before `target_date`.
+
+    Falls back to `fallback` if `hist` is empty or has no rows on or
+    before `target_date`.
+    """
+    if hist.empty:
+        return fallback
+    prior_rows = hist[hist.index.date <= target_date]
+    if prior_rows.empty:
+        return fallback
+    return prior_rows['Close'].iloc[-1]
+
 def get_performance():
     MY_PORTFOLIO = load_portfolio()
     total_cost = 0
@@ -46,6 +59,9 @@ def get_performance():
     last_day_of_prev_year = date(today.year - 1, 12, 31)
     # Reference date for the trailing 1-year performance (365 days ago)
     one_year_ago = today - timedelta(days=365)
+    # Earliest date we need historical data for, so both the YTD and the
+    # 1-year reference price can be read from a single history() call.
+    earliest_target_date = min(last_day_of_prev_year, one_year_ago)
 
     for symbol, data in MY_PORTFOLIO.items():
         try:
@@ -60,23 +76,14 @@ def get_performance():
             current_price = info['last_price']
             prev_close = info['regular_market_previous_close']
 
-            # Get historical data to find the closing price at the start of the year
-            # We look for the data from the last day of the previous year, going back up to 7 days to find a trading day.
-            hist = ticker.history(start=last_day_of_prev_year - timedelta(days=7), end=last_day_of_prev_year + timedelta(days=1))
-            if not hist.empty:
-                ytd_start_price = hist['Close'].iloc[-1]
-            else:
-                # Fallback if no historical data is found, use previous close
-                ytd_start_price = prev_close
-
-            # Get historical data to find the closing price ~365 days ago,
-            # going back up to 7 extra days to find a trading day.
-            year_hist = ticker.history(start=one_year_ago - timedelta(days=7), end=one_year_ago + timedelta(days=1))
-            if not year_hist.empty:
-                year_start_price = year_hist['Close'].iloc[-1]
-            else:
-                # Fallback if no historical data is found, use previous close
-                year_start_price = prev_close
+            # Fetch one history window covering both reference dates (YTD
+            # start and 1-year-ago), instead of one history() call per
+            # date, to roughly halve the historical-data requests per
+            # ticker. Starts 7 days early so a valid trading day is found
+            # even if the exact target date falls on a weekend/holiday.
+            hist = ticker.history(start=earliest_target_date - timedelta(days=7), end=today + timedelta(days=1))
+            ytd_start_price = _closing_price_on_or_before(hist, last_day_of_prev_year, prev_close)
+            year_start_price = _closing_price_on_or_before(hist, one_year_ago, prev_close)
 
             # 2. If the data is in USD, convert it to EUR
             if currency == 'USD':
