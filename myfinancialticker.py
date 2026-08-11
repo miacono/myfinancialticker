@@ -58,6 +58,26 @@ def _n_trading_sessions_ago(
     return row.name.date(), row['Close']
 
 
+def _last_intraday_close(hourly_hist: pd.DataFrame, target_date: date, fallback: float) -> float:
+    """Return the last hourly closing price recorded on `target_date`.
+
+    Falls back to `fallback` if `hourly_hist` has no rows on that date.
+    Yahoo Finance's own `5D` figure is anchored to the last *intraday*
+    trade before the window starts, not the end-of-day official closing
+    price `_n_trading_sessions_ago` reads from daily bars — for
+    low-volatility instruments those two can differ by a cent or more,
+    which is disproportionate for a period this short. Confirmed by
+    reading Yahoo's own portfolio-performance-chart API response and
+    matching its `baseline` field to the cent.
+    """
+    if hourly_hist.empty:
+        return fallback
+    day_rows = hourly_hist[hourly_hist.index.date == target_date]
+    if day_rows.empty:
+        return fallback
+    return day_rows['Close'].iloc[-1]
+
+
 def _value_as_of(lots: list[list], target_date: date, market_price: float) -> float:
     """Value a ticker's lots as they stood on `target_date`.
 
@@ -184,8 +204,9 @@ def get_performance() -> str:
             # the last completed session, matching fast_info's `last_price`
             # and `regular_market_previous_close` exactly. fast_info is only
             # used below for `currency`, which the history response doesn't
-            # carry. This keeps requests at 2 per ticker instead of 3
-            # (fast_info alone costs 2 requests; history() costs 1).
+            # carry. This keeps requests at 2 per ticker for `1M`/`YTD`/`1Y`
+            # (fast_info alone costs 2 requests; history() costs 1); `5D`
+            # below adds a 3rd, smaller request for hourly data.
             current_price = hist['Close'].iloc[-1]
             prev_close = hist['Close'].iloc[-2] if len(hist) >= 2 else current_price
 
@@ -195,6 +216,22 @@ def get_performance() -> str:
             five_days_start_date, five_days_start_price = _n_trading_sessions_ago(
                 hist, 5, five_days_ago, prev_close
             )
+            # Refine the 5D reference price with an intraday (hourly) fetch:
+            # Yahoo's own `5D` anchors to the last intraday trade before the
+            # window starts, which for low-volatility instruments can differ
+            # from the official daily close above by more than is
+            # proportionate for a period this short. This 3rd request is a
+            # small, short-range one (a handful of days of hourly bars, not
+            # the full 1M/YTD/1Y window), and falls back to the daily-close
+            # price above if it fails for any reason.
+            try:
+                hourly_hist = ticker.history(
+                    start=today - timedelta(days=10), end=today + timedelta(days=1), interval="1h"
+                )
+            except Exception:
+                hourly_hist = pd.DataFrame()
+            five_days_start_price = _last_intraday_close(hourly_hist, five_days_start_date, five_days_start_price)
+
             one_month_start_price = _closing_price_on_or_before(hist, one_month_ago, prev_close)
             ytd_start_price = _closing_price_on_or_before(hist, last_day_of_prev_year, prev_close)
             year_start_price = _closing_price_on_or_before(hist, one_year_ago, prev_close)

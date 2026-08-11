@@ -22,7 +22,11 @@ class _FakeTicker:
             raise RuntimeError(f"forced fast_info failure for {self._symbol}")
         return self._config["fast_info"]
 
-    def history(self, start=None, end=None):
+    def history(self, start=None, end=None, interval=None):
+        if interval == "1h":
+            if self._config.get("raise_on_hourly_history"):
+                raise RuntimeError(f"forced hourly history failure for {self._symbol}")
+            return self._config.get("hourly_history", pd.DataFrame())
         if self._config.get("raise_on_history"):
             raise RuntimeError(f"forced history failure for {self._symbol}")
         return self._config["history"]
@@ -190,6 +194,31 @@ def test_n_trading_sessions_ago_uses_fallback_when_not_enough_rows():
 
     assert result_date == date(2000, 1, 1)
     assert result_price == -1.0
+
+
+def test_last_intraday_close_returns_last_hourly_row_on_target_date():
+    hourly_hist = _hist_df(
+        ["2026-08-04 14:00", "2026-08-04 15:00", "2026-08-05 09:00"],
+        [10.0, 10.5, 11.0],
+    )
+
+    price = mft._last_intraday_close(hourly_hist, date(2026, 8, 4), fallback=-1.0)
+
+    assert price == 10.5
+
+
+def test_last_intraday_close_uses_fallback_when_no_rows_on_date():
+    hourly_hist = _hist_df(["2026-08-05 09:00"], [11.0])
+
+    price = mft._last_intraday_close(hourly_hist, date(2026, 8, 4), fallback=-1.0)
+
+    assert price == -1.0
+
+
+def test_last_intraday_close_uses_fallback_when_empty():
+    price = mft._last_intraday_close(pd.DataFrame(), date(2026, 8, 4), fallback=-1.0)
+
+    assert price == -1.0
 
 
 def test_value_as_of_all_lots_held_uses_market_price():
@@ -405,6 +434,55 @@ def test_get_performance_multiple_lots_value_correctly_by_purchase_date(monkeypa
     # 5D is after the first purchase but before the second: mixed pricing.
     five_days_ago = today - timedelta(days=5)
     assert mft._value_as_of(lots, five_days_ago, 77.0) == 77.0 + 90.0
+
+
+def test_get_performance_uses_hourly_price_to_refine_5d(monkeypatch):
+    today = date.today()
+    dates = [today - timedelta(days=offset) for offset in range(39, -1, -1)]
+    closes = [100.0 + i for i in range(len(dates))]
+    hist = _hist_df(dates, closes)
+
+    five_days_start_date, _ = mft._n_trading_sessions_ago(hist, 5, today - timedelta(days=5), 0.0)
+    # The hourly close differs from the daily close on the 5D reference
+    # date: get_performance should prefer this refined value.
+    hourly_hist = _hist_df(
+        [f"{five_days_start_date} 15:00", f"{today} 09:00"], [999.0, 1234.0]
+    )
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "NEW": {"fast_info": {"currency": "EUR"}, "history": hist, "hourly_history": hourly_hist},
+    }
+    lots = [[1, 50.0, _LONG_AGO]]
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"NEW": lots})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    current_price = hist["Close"].iloc[-1]
+    expected_five_days_start_total_value = mft._value_as_of(lots, five_days_start_date, 999.0)
+    assert f"({current_price - expected_five_days_start_total_value:+.2f}€)" in result.split("5D: ")[1]
+
+
+def test_get_performance_hourly_history_failure_falls_back_to_daily_close(monkeypatch):
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    hist = _hist_df([yesterday, today], [10.0, 12.0])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "ONLY": {"fast_info": {"currency": "EUR"}, "history": hist, "raise_on_hourly_history": True},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"ONLY": [[1, 40.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    # Same expectation as the plain single-row-history case: the failed
+    # hourly fetch falls back to the daily-close-derived price untouched.
+    expected = mft.format_performance(40.0, 12.0, 10.0, 10.0, 10.0, 10.0, 10.0)
+
+    assert result == expected
 
 
 def test_get_performance_empty_portfolio_returns_error_sentinel(monkeypatch):

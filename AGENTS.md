@@ -48,7 +48,7 @@ in mind when adding or editing any comment or doc file.
 
 ## How it works
 
-`myfinancialticker.py` has seven functions:
+`myfinancialticker.py` has eight functions:
 
 - `load_portfolio(filename="portfolio.json")` — loads the portfolio JSON,
   resolving the path relative to the script's own location (not the current
@@ -69,6 +69,17 @@ in mind when adding or editing any comment or doc file.
   lookback often only spans 3-4 real trading sessions once a weekend falls
   inside it, which — unlike for the longer periods — materially
   understates a window this short. No I/O, directly unit-testable.
+
+- `_last_intraday_close(hourly_hist, target_date, fallback)` — pure helper
+  that returns the last hourly closing price recorded on `target_date`, or
+  `fallback` if `hourly_hist` has no rows on that date. Used to refine the
+  `5D` reference price found above: Yahoo's own figure is anchored to the
+  last *intraday* trade before the window starts, not the end-of-day
+  official closing price, and for low-volatility instruments (e.g. a cash
+  ETF) those two can differ enough to matter over a period this short.
+  Confirmed by reading Yahoo's own portfolio-performance-chart API
+  response (`portfolio-timeseries-api/v2/portfolio/performance/chart`) and
+  matching its `baseline` field to the cent. No I/O, directly unit-testable.
 
 - `_value_as_of(lots, target_date, market_price)` — pure helper that values
   a ticker's lots (`[[shares, cost, purchase_date], ...]`) as of
@@ -103,18 +114,24 @@ in mind when adding or editing any comment or doc file.
      dates 5 days ago, 30 days ago, and 365 days ago (for the 5D, 1M, and
      trailing 1-year metrics).
   3. For each ticker in the portfolio (`{"TICKER": [[shares, cost,
-     purchase_date], ...]}`), makes exactly **2** requests to Yahoo Finance:
-     - **One** `history()` call per ticker, with a window that covers all
-       reference dates (5D, 1M, YTD start, and 1-year-ago). Current price and
-       previous close are read from this same DataFrame's last two rows
+     purchase_date], ...]}`), makes **3** requests to Yahoo Finance:
+     - **One** daily `history()` call per ticker, with a window that covers
+       all reference dates (5D, 1M, YTD start, and 1-year-ago). Current price
+       and previous close are read from this same DataFrame's last two rows
        (`hist['Close'].iloc[-1]`/`[-2]`) — verified to be byte-identical to
        `fast_info`'s `last_price`/`regular_market_previous_close`. `1M`/`YTD`/
-       `1Y` reference prices come from `_closing_price_on_or_before`; `5D`
-       comes from `_n_trading_sessions_ago` instead (see above for why).
+       `1Y` reference prices come from `_closing_price_on_or_before`; `5D`'s
+       reference *date* comes from `_n_trading_sessions_ago` instead (see
+       above for why).
      - **One** `fast_info` access, used only for `currency` — `fast_info`
        alone costs 2 requests when `last_price`/`regular_market_previous_close`
        are also read, so those fields are deliberately *not* read from it
        anymore.
+     - **One** short-range `history(interval="1h")` call, used only to
+       refine `5D`'s reference *price* via `_last_intraday_close` once its
+       date is known (see above). Wrapped in its own `try`/`except`, falling
+       back to the daily-close price on failure, so a hiccup here degrades
+       `5D`'s precision rather than dropping the ticker from every metric.
      - Converts USD-denominated prices to EUR using the fetched rate. Lot
        costs are never converted — they're what was actually paid, already
        in EUR.
@@ -132,10 +149,11 @@ in mind when adding or editing any comment or doc file.
        bought since)` to the cent. `_value_as_of` generalizes that: lots
        already held at a target date are priced at that date's market
        price, lots bought after it are valued at their own cost. Combined
-       with the trading-session-based `5D` reference above, real output
-       now matches Yahoo's own figures for `1D`/`1M`/`YTD`/`1Y`/`T` exactly
-       and `5D` to within a small residual (Yahoo's precise session-count
-       convention isn't public, so an exact match isn't guaranteed there).
+       with the trading-session-based `5D` date and the intraday-refined
+       `5D` price above, real output now matches Yahoo's own figures for
+       `1D`/`5D`/`1M`/`YTD`/`1Y`/`T` exactly — verified against a real
+       portfolio's actual figures, including by reading Yahoo's own
+       portfolio-performance API response directly.
      - Accumulates total cost, current value, previous-day value, 5-day-ago
        value, 1-month-ago value, YTD-start value, and 1-year-ago value.
      - Any per-ticker error is silently skipped (`except Exception: continue`)
@@ -208,13 +226,15 @@ see "How it works" above.
   parameterize it, call that out explicitly since it directly affects reported
   values when the live rate fetch fails.
 - **Keep network calls per ticker to a minimum.** Yahoo Finance rate-limits
-  (HTTP 429) have been observed in practice; `get_performance()` is written
-  to make exactly 2 requests per ticker (one `history()` call, one
-  `fast_info` access used only for `currency`). See "How it works" above for
-  why this is the floor with the current public `yfinance` API. Prefer
-  adding logic to the existing pure helpers (`_closing_price_on_or_before`,
-  `_n_trading_sessions_ago`, `_value_as_of`, `format_performance`) over
-  adding new network calls.
+  (HTTP 429) have been observed in practice; `get_performance()` makes 3
+  requests per ticker (daily `history()`, `fast_info` for `currency`, and a
+  short-range hourly `history()` for `5D` precision — see "How it works").
+  The 3rd request was added deliberately, as a known, accepted trade-off
+  for matching Yahoo's `5D` figure exactly; don't add further requests
+  without calling out the same trade-off explicitly. Prefer adding logic to
+  the existing pure helpers (`_closing_price_on_or_before`,
+  `_n_trading_sessions_ago`, `_last_intraday_close`, `_value_as_of`,
+  `format_performance`) over adding new network calls.
 
 ## Useful commands
 
