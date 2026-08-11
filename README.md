@@ -70,11 +70,11 @@ The output shows daily performance (percentage and absolute variance from the pr
 
 ## Development
 
-Install the development dependencies (adds `pytest` on top of the runtime requirements) and run the test suite:
+Install the development dependencies (adds `pytest` and `pytest-cov` on top of the runtime requirements) and run the test suite:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests cover `load_portfolio` and the pure calculation/formatting logic; they don't hit the network or depend on live market data.
+`yfinance`/`yf.Ticker` is mocked throughout, so the tests don't hit the network or depend on live market data. Every run also measures coverage and fails if it drops below 95% (configured in `pyproject.toml`); the suite currently reaches 100%.
