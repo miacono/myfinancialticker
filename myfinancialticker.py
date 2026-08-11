@@ -29,6 +29,7 @@ def get_performance():
     current_total_value = 0
     yesterday_total_value = 0
     ytd_start_total_value = 0  # Year-to-Date start value
+    year_start_total_value = 0  # Trailing 1-year (365 days) start value
 
     # 1. Get the current EUR/USD exchange rate (e.g., 1.08)
     # We use the special ticker 'EURUSD=X'
@@ -40,6 +41,8 @@ def get_performance():
     # Get the last trading day of the previous year
     today = date.today()
     last_day_of_prev_year = date(today.year - 1, 12, 31)
+    # Reference date for the trailing 1-year performance (365 days ago)
+    one_year_ago = today - timedelta(days=365)
 
     for symbol, data in MY_PORTFOLIO.items():
         try:
@@ -63,16 +66,27 @@ def get_performance():
                 # Fallback if no historical data is found, use previous close
                 ytd_start_price = prev_close
 
+            # Get historical data to find the closing price ~365 days ago,
+            # going back up to 7 extra days to find a trading day.
+            year_hist = ticker.history(start=one_year_ago - timedelta(days=7), end=one_year_ago + timedelta(days=1))
+            if not year_hist.empty:
+                year_start_price = year_hist['Close'].iloc[-1]
+            else:
+                # Fallback if no historical data is found, use previous close
+                year_start_price = prev_close
+
             # 2. If the data is in USD, convert it to EUR
             if currency == 'USD':
                 current_price *= usd_eur_rate
                 prev_close *= usd_eur_rate
                 ytd_start_price *= usd_eur_rate
+                year_start_price *= usd_eur_rate
 
             total_cost += qty * cost
             current_total_value += qty * current_price
             yesterday_total_value += qty * prev_close
             ytd_start_total_value += qty * ytd_start_price
+            year_start_total_value += qty * year_start_price
         except Exception:
             continue
 
@@ -85,15 +99,19 @@ def get_performance():
     # YTD
     ytd_net = current_total_value - ytd_start_total_value
     ytd_perc = (ytd_net / ytd_start_total_value) * 100 if ytd_start_total_value != 0 else 0
+    # Trailing 1-year (365 days)
+    year_net = current_total_value - year_start_total_value
+    year_perc = (year_net / year_start_total_value) * 100 if year_start_total_value != 0 else 0
     # Total
     total_net = current_total_value - total_cost
     total_perc = (total_net / total_cost) * 100 if total_cost != 0 else 0
 
     t_icon = "▲" if total_net >= 0 else "▼"
     d_icon = "▲" if daily_net >= 0 else "▼"
-    y_icon = "▲" if ytd_net >= 0 else "▼"
+    ytd_icon = "▲" if ytd_net >= 0 else "▼"
+    y_icon = "▲" if year_net >= 0 else "▼"
 
-    return f"D: {d_icon} {daily_perc:.2f}% ({daily_net:+.2f}€) | Y: {y_icon} {ytd_perc:.2f}% ({ytd_net:+.2f}€) | T: {t_icon} {total_perc:.2f}% ({total_net:.2f}€)"
+    return f"1D: {d_icon} {daily_perc:.2f}% ({daily_net:+.2f}€) | YTD: {ytd_icon} {ytd_perc:.2f}% ({ytd_net:+.2f}€) | 1Y: {y_icon} {year_perc:.2f}% ({year_net:+.2f}€) | T: {t_icon} {total_perc:.2f}% ({total_net:.2f}€)"
 
 if __name__ == "__main__":
     try:

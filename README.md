@@ -62,8 +62,8 @@ python myfinancialticker.py
 
 ### Sample Output
 
-The output shows daily performance (percentage and absolute variance from the previous close) and total performance (percentage and absolute profit/loss).
+The output shows daily performance (percentage and absolute variance from the previous close), year-to-date (YTD) performance, trailing 1-year performance, and total performance (percentage and absolute profit/loss), using Yahoo Finance's own labels (`1D`, `YTD`, `1Y`, `T`).
 
 ```
-▲0.45% (+15.30€) | ▲5.80% (195.50€)
+1D: ▲ 0.45% (+15.30€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)
 ```

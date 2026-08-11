@@ -32,19 +32,27 @@ and total profit/loss). It's designed to be embedded in terminal status bars
 - `get_performance()` — the core logic:
   1. Fetches the EUR/USD exchange rate via `yf.Ticker("EURUSD=X")`, falling
      back to a hardcoded `0.92` if the fetch fails.
-  2. Determines the last trading day of the previous year (for YTD).
+  2. Determines the last trading day of the previous year (for YTD) and the
+     date 365 days ago (for the trailing 1-year metric).
   3. For each ticker in the portfolio (`{"TICKER": [quantity, avg_cost]}`):
      - Fetches current price and previous close via `fast_info`.
-     - Fetches historical data to find the closing price at year start,
-       looking back up to 7 days to land on a valid trading day.
+     - Fetches historical data to find the closing price at calendar year
+       start (YTD) and ~365 days ago (trailing 1-year), each looking back up
+       to 7 days to land on a valid trading day.
      - Converts USD-denominated prices to EUR using the fetched rate.
-     - Accumulates total cost, current value, previous-day value, and
-       year-start value.
+     - Accumulates total cost, current value, previous-day value, YTD-start
+       value, and 1-year-ago value.
      - Any per-ticker error is silently skipped (`except Exception: continue`)
        so one bad/delisted ticker doesn't break the whole output.
-  4. Computes daily, YTD, and total performance (percentage and absolute € value)
-     and returns a single formatted string with ▲/▼ icons, e.g.:
-     `D: ▲ 0.45% (+15.30€) | Y: ▲ 5.80% (195.50€) | T: ▲ 12.30% (450.00€)`
+  4. Computes daily, YTD, trailing 1-year, and total performance (percentage
+     and absolute € value) and returns a single formatted string using
+     Yahoo Finance's own labels, in this order, with ▲/▼ icons, e.g.:
+     `1D: ▲ 0.45% (+15.30€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)`
+
+     - `1D` = daily change vs. previous close
+     - `YTD` = year-to-date change (since Dec 31 of previous year)
+     - `1Y` = trailing 1-year change (365 days ago vs. now)
+     - `T` = total change vs. average purchase cost
 
 `__main__` calls `get_performance()` and prints the result, wrapped in a
 generic try/except so the script never crashes with a traceback (important
