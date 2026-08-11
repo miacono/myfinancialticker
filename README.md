@@ -12,7 +12,7 @@ A simple Python script to monitor the performance of an investment portfolio dir
 
 ## Prerequisites
 
-- Python 3.6+
+- Python 3.9+ (required by the pinned `pandas` version)
 
 ## Installation
 
@@ -67,3 +67,14 @@ The output shows daily performance (percentage and absolute variance from the pr
 ```
 1D: ▲ 0.45% (+15.30€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)
 ```
+
+## Development
+
+Install the development dependencies (adds `pytest` on top of the runtime requirements) and run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests cover `load_portfolio` and the pure calculation/formatting logic; they don't hit the network or depend on live market data.
