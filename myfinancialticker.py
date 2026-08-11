@@ -107,22 +107,28 @@ def get_performance() -> str:
     for symbol, holding in portfolio.items():
         try:
             ticker = yf.Ticker(symbol)
-            info = ticker.fast_info
-
-            # Ticker's currency (e.g., 'EUR' or 'USD')
-            currency = info.get('currency', 'EUR')
-
             qty, cost = holding  # Unpack quantity and average purchase cost
-
-            current_price = info['last_price']
-            prev_close = info['regular_market_previous_close']
 
             # Fetch one history window covering both reference dates (YTD
             # start and 1-year-ago), instead of one history() call per
-            # date, to roughly halve the historical-data requests per
-            # ticker. Starts 7 days early so a valid trading day is found
+            # date. Starts 7 days early so a valid trading day is found
             # even if the exact target date falls on a weekend/holiday.
             hist = ticker.history(start=earliest_target_date - timedelta(days=7), end=today + timedelta(days=1))
+
+            # Read current price and previous close from this same history
+            # window instead of a separate fast_info call: the last row is
+            # today's (still-forming) session and the second-to-last row is
+            # the last completed session, matching fast_info's `last_price`
+            # and `regular_market_previous_close` exactly. fast_info is only
+            # used below for `currency`, which the history response doesn't
+            # carry. This keeps requests at 2 per ticker instead of 3
+            # (fast_info alone costs 2 requests; history() costs 1).
+            current_price = hist['Close'].iloc[-1]
+            prev_close = hist['Close'].iloc[-2] if len(hist) >= 2 else current_price
+
+            # Ticker's currency (e.g., 'EUR' or 'USD')
+            currency = ticker.fast_info.get('currency', 'EUR')
+
             ytd_start_price = _closing_price_on_or_before(hist, last_day_of_prev_year, prev_close)
             year_start_price = _closing_price_on_or_before(hist, one_year_ago, prev_close)
 
