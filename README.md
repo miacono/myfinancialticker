@@ -33,21 +33,42 @@ A simple Python script to monitor the performance of an investment portfolio dir
 To use the script, you need to create a `portfolio.json` file in the project's root directory. This file will hold your portfolio data.
 
 1.  Create a file named `portfolio.json`.
-2.  Add your assets using the following JSON format:
+2.  Add your assets as a list of purchase lots per ticker, each lot being
+    `[QUANTITY, PRICE_PAID, "PURCHASE_DATE"]` (date in ISO `YYYY-MM-DD`
+    format):
 
     ```json
     {
-        "TICKER_1": [QUANTITY, AVERAGE_PURCHASE_PRICE],
-        "TICKER_2": [QUANTITY, AVERAGE_PURCHASE_PRICE]
+        "TICKER_1": [
+            [QUANTITY, PRICE_PAID, "PURCHASE_DATE"]
+        ],
+        "TICKER_2": [
+            [QUANTITY, PRICE_PAID, "PURCHASE_DATE"],
+            [QUANTITY, PRICE_PAID, "PURCHASE_DATE"]
+        ]
     }
     ```
+
+    Recording each purchase separately (instead of a single average cost)
+    lets the script correctly value a period like `5D`/`1M`/`YTD`/`1Y` even
+    when you bought more shares partway through it: shares you already
+    owned at the start of the period are priced at that day's market price,
+    while shares bought during the period are valued at what you actually
+    paid for them — the same approach Yahoo Finance itself uses, and it's
+    also why `1Y` and `T` (total) end up equal for a position you've held
+    for less than a year.
 
     **Example:**
     ```json
     {
-        "SWDA.MI": [19, 106.32],
-        "VUAA.MI": [1, 107.68],
-        "GOOGL": [5, 150.75]
+        "SWDA.MI": [
+            [15, 104.92, "2025-08-26"],
+            [1, 108.70, "2025-10-13"],
+            [1, 112.24, "2025-11-12"]
+        ],
+        "GOOGL": [
+            [5, 150.75, "2024-03-01"]
+        ]
     }
     ```
     > **Note:** The `portfolio.json` file is already included in `.gitignore` to protect your personal data.
@@ -62,10 +83,10 @@ python myfinancialticker.py
 
 ### Sample Output
 
-The output shows daily performance (percentage and absolute variance from the previous close), year-to-date (YTD) performance, trailing 1-year performance, and total performance (percentage and absolute profit/loss), using Yahoo Finance's own labels (`1D`, `YTD`, `1Y`, `T`).
+The output shows daily performance (percentage and absolute variance from the previous close), trailing 5-day performance, trailing 1-month performance, year-to-date (YTD) performance, trailing 1-year performance, and total performance (percentage and absolute profit/loss), using Yahoo Finance's own labels (`1D`, `5D`, `1M`, `YTD`, `1Y`, `T`).
 
 ```
-1D: ▲ 0.45% (+15.30€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)
+1D: ▲ 0.45% (+15.30€) | 5D: ▲ 1.20% (+40.00€) | 1M: ▲ 3.10% (+100.00€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)
 ```
 
 ## Development

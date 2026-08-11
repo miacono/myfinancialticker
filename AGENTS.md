@@ -5,9 +5,9 @@ Guidelines for any AI agent (Claude, Gemini, or other) working in this repositor
 ## Overview
 
 `myfinancialticker` is a small, single-script Python tool that prints a compact
-one-line summary of an investment portfolio's performance (daily, year-to-date,
-and total profit/loss). It's designed to be embedded in terminal status bars
-(xbar, polybar, i3blocks, etc.).
+one-line summary of an investment portfolio's performance (daily, 5-day,
+1-month, year-to-date, trailing 1-year, and total profit/loss). It's designed
+to be embedded in terminal status bars (xbar, polybar, i3blocks, etc.).
 
 ## Git workflow
 
@@ -48,7 +48,7 @@ in mind when adding or editing any comment or doc file.
 
 ## How it works
 
-`myfinancialticker.py` has five functions:
+`myfinancialticker.py` has seven functions:
 
 - `load_portfolio(filename="portfolio.json")` — loads the portfolio JSON,
   resolving the path relative to the script's own location (not the current
@@ -58,17 +58,38 @@ in mind when adding or editing any comment or doc file.
 - `_closing_price_on_or_before(hist, target_date, fallback)` — pure helper
   that returns the last closing price in an already-fetched history
   `DataFrame` on or before `target_date`, or `fallback` if none is found.
-  No I/O, so it's directly unit-testable.
+  No I/O, so it's directly unit-testable. Used for `1M`/`YTD`/`1Y`, where a
+  calendar-date lookback is an accurate enough approximation of Yahoo's own
+  figures (verified against real output — see below).
+
+- `_n_trading_sessions_ago(hist, n, fallback_date, fallback_price)` — pure
+  helper that returns the `(date, closing price)` of the trading session
+  `n` sessions before the most recent row in `hist`, or the fallback pair
+  if there aren't enough rows. Used only for `5D`: a calendar 5-day
+  lookback often only spans 3-4 real trading sessions once a weekend falls
+  inside it, which — unlike for the longer periods — materially
+  understates a window this short. No I/O, directly unit-testable.
+
+- `_value_as_of(lots, target_date, market_price)` — pure helper that values
+  a ticker's lots (`[[shares, cost, purchase_date], ...]`) as of
+  `target_date`: lots already purchased by then are valued at
+  `market_price`, lots purchased afterward are valued at their own cost
+  (they didn't exist as a holding on `target_date`, so pricing them at a
+  historical market price would misstate what the portfolio was actually
+  worth then). No I/O, directly unit-testable.
 
 - `format_performance(total_cost, current_total_value, yesterday_total_value,
+  five_days_start_total_value, one_month_start_total_value,
   ytd_start_total_value, year_start_total_value)` — pure function (no I/O)
-  that computes daily, YTD, trailing 1-year, and total performance
-  (percentage and absolute € value) from already-aggregated EUR totals, and
-  returns a single formatted string using Yahoo Finance's own labels, in
-  this order, with ▲/▼ icons, e.g.:
-  `1D: ▲ 0.45% (+15.30€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)`
+  that computes daily, 5-day, 1-month, YTD, trailing 1-year, and total
+  performance (percentage and absolute € value) from already-aggregated EUR
+  totals, and returns a single formatted string using Yahoo Finance's own
+  labels, in this order, with ▲/▼ icons, e.g.:
+  `1D: ▲ 0.45% (+15.30€) | 5D: ▲ 1.20% (+40.00€) | 1M: ▲ 3.10% (+100.00€) | YTD: ▲ 5.80% (195.50€) | 1Y: ▲ 8.10% (250.00€) | T: ▲ 12.30% (450.00€)`
 
   - `1D` = daily change vs. previous close
+  - `5D` = change over the trailing 5 *trading* days (see `_n_trading_sessions_ago`)
+  - `1M` = change over the trailing 1 month (30 calendar days)
   - `YTD` = year-to-date change (since Dec 31 of previous year)
   - `1Y` = trailing 1-year change (365 days ago vs. now)
   - `T` = total change vs. average purchase cost
@@ -79,22 +100,44 @@ in mind when adding or editing any comment or doc file.
   1. Fetches the EUR/USD exchange rate via `yf.Ticker("EURUSD=X")`, falling
      back to a hardcoded `0.92` if the fetch fails.
   2. Determines the last trading day of the previous year (for YTD) and the
-     date 365 days ago (for the trailing 1-year metric).
-  3. For each ticker in the portfolio (`{"TICKER": [quantity, avg_cost]}`),
-     makes exactly **2** requests to Yahoo Finance:
-     - **One** `history()` call per ticker, with a window that covers both
-       reference dates (YTD start and 1-year-ago). Current price and
+     dates 5 days ago, 30 days ago, and 365 days ago (for the 5D, 1M, and
+     trailing 1-year metrics).
+  3. For each ticker in the portfolio (`{"TICKER": [[shares, cost,
+     purchase_date], ...]}`), makes exactly **2** requests to Yahoo Finance:
+     - **One** `history()` call per ticker, with a window that covers all
+       reference dates (5D, 1M, YTD start, and 1-year-ago). Current price and
        previous close are read from this same DataFrame's last two rows
        (`hist['Close'].iloc[-1]`/`[-2]`) — verified to be byte-identical to
-       `fast_info`'s `last_price`/`regular_market_previous_close`. YTD/1Y
-       reference prices are read from it via `_closing_price_on_or_before`.
+       `fast_info`'s `last_price`/`regular_market_previous_close`. `1M`/`YTD`/
+       `1Y` reference prices come from `_closing_price_on_or_before`; `5D`
+       comes from `_n_trading_sessions_ago` instead (see above for why).
      - **One** `fast_info` access, used only for `currency` — `fast_info`
        alone costs 2 requests when `last_price`/`regular_market_previous_close`
        are also read, so those fields are deliberately *not* read from it
        anymore.
-     - Converts USD-denominated prices to EUR using the fetched rate.
-     - Accumulates total cost, current value, previous-day value, YTD-start
-       value, and 1-year-ago value.
+     - Converts USD-denominated prices to EUR using the fetched rate. Lot
+       costs are never converted — they're what was actually paid, already
+       in EUR.
+     - Values every lookback window (yesterday, 5D, 1M, YTD, 1Y) via
+       `_value_as_of(lots, target_date, market_price)` rather than a flat
+       `current_qty * historical_price`. This matters whenever the position
+       size changed within a window: pricing today's full quantity against
+       a past date overstates or understates what the portfolio was
+       actually worth back then. It was diagnosed by comparing output
+       against Yahoo Finance's own portfolio "Rendimento" view — for a
+       position accumulated via several purchases over less than a year,
+       Yahoo's `1Y` figure exactly matched `T` (both effectively clamped to
+       the since-first-purchase return), and its `YTD` baseline matched
+       `(quantity held at YTD start × YTD-start price) + (cost of shares
+       bought since)` to the cent. `_value_as_of` generalizes that: lots
+       already held at a target date are priced at that date's market
+       price, lots bought after it are valued at their own cost. Combined
+       with the trading-session-based `5D` reference above, real output
+       now matches Yahoo's own figures for `1D`/`1M`/`YTD`/`1Y`/`T` exactly
+       and `5D` to within a small residual (Yahoo's precise session-count
+       convention isn't public, so an exact match isn't guaranteed there).
+     - Accumulates total cost, current value, previous-day value, 5-day-ago
+       value, 1-month-ago value, YTD-start value, and 1-year-ago value.
      - Any per-ticker error is silently skipped (`except Exception: continue`)
        so one bad/delisted ticker doesn't break the whole output.
   4. Calls `format_performance(...)` with the accumulated totals and returns
@@ -127,14 +170,26 @@ in mind when adding or editing any comment or doc file.
 ## Portfolio data format
 
 `portfolio.json` maps ticker symbols (Yahoo Finance format, e.g. `SWDA.MI`,
-`GOOGL`) to a `[quantity, average_purchase_price]` pair:
+`GOOGL`) to a **list of purchase lots**, each lot being
+`[shares, price_paid, purchase_date]` (date as an ISO `YYYY-MM-DD` string):
 
 ```json
 {
-    "SWDA.MI": [19, 106.32],
-    "GOOGL": [5, 150.75]
+    "SWDA.MI": [
+        [15, 104.92, "2025-08-26"],
+        [1, 108.70, "2025-10-13"]
+    ],
+    "GOOGL": [
+        [5, 150.75, "2024-03-01"]
+    ]
 }
 ```
+
+Every lot needs all three fields — there's no single-lot/average-cost
+shorthand. Recording each purchase separately (instead of one aggregate
+quantity + average cost) is what lets `_value_as_of` price `5D`/`1M`/`YTD`/
+`1Y` correctly when the position size changed partway through the window —
+see "How it works" above.
 
 ## Conventions and constraints
 
@@ -158,7 +213,8 @@ in mind when adding or editing any comment or doc file.
   `fast_info` access used only for `currency`). See "How it works" above for
   why this is the floor with the current public `yfinance` API. Prefer
   adding logic to the existing pure helpers (`_closing_price_on_or_before`,
-  `format_performance`) over adding new network calls.
+  `_n_trading_sessions_ago`, `_value_as_of`, `format_performance`) over
+  adding new network calls.
 
 ## Useful commands
 
