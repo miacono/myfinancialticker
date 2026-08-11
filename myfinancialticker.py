@@ -156,8 +156,13 @@ def get_performance() -> str:
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Print the performance ticker line, or an error message on failure."""
     try:
         print(get_performance())
     except Exception as e:
         print(f"Error: {e}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
