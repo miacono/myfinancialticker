@@ -9,6 +9,16 @@ one-line summary of an investment portfolio's performance (daily, year-to-date,
 and total profit/loss). It's designed to be embedded in terminal status bars
 (xbar, polybar, i3blocks, etc.).
 
+## Git workflow
+
+- **Always commit atomically.** Each commit should contain one logical,
+  self-contained change (one fix, one refactor step, one doc update, etc.)
+  with a message describing just that change. Don't bundle unrelated
+  changes into a single commit, even within the same task.
+- **Never push without asking first**, even if a previous push in the same
+  session was already approved — always confirm again before running
+  `git push`. Committing locally does not require asking.
+
 ## Language
 
 All code comments, docstrings, and project documentation files (`README.md`,
@@ -67,15 +77,18 @@ in mind when adding or editing any comment or doc file.
      back to a hardcoded `0.92` if the fetch fails.
   2. Determines the last trading day of the previous year (for YTD) and the
      date 365 days ago (for the trailing 1-year metric).
-  3. For each ticker in the portfolio (`{"TICKER": [quantity, avg_cost]}`):
-     - Fetches current price and previous close via `fast_info`.
-     - Fetches **one** `history()` window per ticker that covers both
-       reference dates (YTD start and 1-year-ago), then reads both prices
-       out of it via `_closing_price_on_or_before` — this is a deliberate
-       choice to keep network requests down (2 requests per ticker instead
-       of 3) after real rate-limiting (HTTP 429) was observed from Yahoo
-       Finance during development. Don't reintroduce a second `history()`
-       call per ticker.
+  3. For each ticker in the portfolio (`{"TICKER": [quantity, avg_cost]}`),
+     makes exactly **2** requests to Yahoo Finance:
+     - **One** `history()` call per ticker, with a window that covers both
+       reference dates (YTD start and 1-year-ago). Current price and
+       previous close are read from this same DataFrame's last two rows
+       (`hist['Close'].iloc[-1]`/`[-2]`) — verified to be byte-identical to
+       `fast_info`'s `last_price`/`regular_market_previous_close`. YTD/1Y
+       reference prices are read from it via `_closing_price_on_or_before`.
+     - **One** `fast_info` access, used only for `currency` — `fast_info`
+       alone costs 2 requests when `last_price`/`regular_market_previous_close`
+       are also read, so those fields are deliberately *not* read from it
+       anymore.
      - Converts USD-denominated prices to EUR using the fetched rate.
      - Accumulates total cost, current value, previous-day value, YTD-start
        value, and 1-year-ago value.
@@ -83,6 +96,23 @@ in mind when adding or editing any comment or doc file.
        so one bad/delisted ticker doesn't break the whole output.
   4. Calls `format_performance(...)` with the accumulated totals and returns
      its result.
+
+  This design was reached after real rate-limiting (HTTP 429) was observed
+  from Yahoo Finance during development, and after tracing actual HTTP calls
+  (via `curl_cffi`, which `yfinance` uses under the hood) to measure the true
+  request count of each approach. Two findings from that investigation:
+  - A true single-request multi-ticker batch is **not possible**: Yahoo's
+    chart endpoint (`v8/finance/chart/<SYMBOL>`), which both `history()` and
+    `yf.download()` rely on, only accepts one symbol per request. Confirmed
+    by tracing `yf.download()` itself, which just issues one request per
+    ticker under the hood — it doesn't reduce request count, only adds
+    threading. Don't attempt to route through `yf.download()`/`yf.Tickers()`
+    expecting a real multi-ticker batch; there isn't one on this API.
+  - `fast_info` internally makes a separate request for `last_price`/
+    `regular_market_previous_close` beyond its basic per-ticker request —
+    hence deriving those two fields from `history()` instead removes a
+    whole request per ticker. Don't add back a `fast_info` access for
+    `last_price`/`regular_market_previous_close`.
 
 `__main__` calls `get_performance()` and prints the result, wrapped in a
 generic try/except so the script never crashes with a traceback (important
@@ -118,8 +148,10 @@ since it runs inside status bar widgets).
   values when the live rate fetch fails.
 - **Keep network calls per ticker to a minimum.** Yahoo Finance rate-limits
   (HTTP 429) have been observed in practice; `get_performance()` is written
-  to make at most 2 requests per ticker (`fast_info` + one `history()` call).
-  Prefer adding logic to the existing pure helpers (`_closing_price_on_or_before`,
+  to make exactly 2 requests per ticker (one `history()` call, one
+  `fast_info` access used only for `currency`). See "How it works" above for
+  why this is the floor with the current public `yfinance` API. Prefer
+  adding logic to the existing pure helpers (`_closing_price_on_or_before`,
   `format_performance`) over adding new network calls.
 
 ## Useful commands
