@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+addopts = "--cov=myfinancialticker --cov-branch --cov-report=term-missing --cov-fail-under=95"
+
+[tool.coverage.run]
+omit = ["tests/*", "conftest.py"]
