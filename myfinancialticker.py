@@ -12,21 +12,22 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
-def load_portfolio(filename="portfolio.json"):
+def load_portfolio(filename: str = "portfolio.json") -> dict[str, list[float]]:
     """Loads the portfolio from a JSON file, searching for it in the same directory as the script."""
     # Calculate the absolute path for the configuration file
     # based on the script's location.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, filename)
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
         sys.exit(f"Error: Configuration file '{config_path}' not found.")
     except json.JSONDecodeError:
         sys.exit(f"Error: The file '{config_path}' is not a valid JSON.")
 
-def _closing_price_on_or_before(hist, target_date, fallback):
+
+def _closing_price_on_or_before(hist: pd.DataFrame, target_date: date, fallback: float) -> float:
     """Return the last closing price in `hist` on or before `target_date`.
 
     Falls back to `fallback` if `hist` is empty or has no rows on or
@@ -39,7 +40,14 @@ def _closing_price_on_or_before(hist, target_date, fallback):
         return fallback
     return prior_rows['Close'].iloc[-1]
 
-def format_performance(total_cost, current_total_value, yesterday_total_value, ytd_start_total_value, year_start_total_value):
+
+def format_performance(
+    total_cost: float,
+    current_total_value: float,
+    yesterday_total_value: float,
+    ytd_start_total_value: float,
+    year_start_total_value: float,
+) -> str:
     """Compute daily/YTD/1Y/total performance and format the ticker string.
 
     Pure function (no I/O): all inputs are already-aggregated portfolio
@@ -70,8 +78,10 @@ def format_performance(total_cost, current_total_value, yesterday_total_value, y
         f"T: {t_icon} {total_perc:.2f}% ({total_net:.2f}€)"
     )
 
-def get_performance():
-    MY_PORTFOLIO = load_portfolio()
+
+def get_performance() -> str:
+    """Fetch prices for every holding and return the formatted performance string."""
+    portfolio = load_portfolio()
     total_cost = 0
     current_total_value = 0
     yesterday_total_value = 0
@@ -94,15 +104,15 @@ def get_performance():
     # 1-year reference price can be read from a single history() call.
     earliest_target_date = min(last_day_of_prev_year, one_year_ago)
 
-    for symbol, data in MY_PORTFOLIO.items():
+    for symbol, holding in portfolio.items():
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.fast_info
-            
+
             # Ticker's currency (e.g., 'EUR' or 'USD')
             currency = info.get('currency', 'EUR')
-            
-            qty, cost = data # Unpack quantity and cost from the list
+
+            qty, cost = holding  # Unpack quantity and average purchase cost
 
             current_price = info['last_price']
             prev_close = info['regular_market_previous_close']
@@ -138,6 +148,7 @@ def get_performance():
         ytd_start_total_value,
         year_start_total_value,
     )
+
 
 if __name__ == "__main__":
     try:
