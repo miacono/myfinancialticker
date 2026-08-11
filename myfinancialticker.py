@@ -39,6 +39,37 @@ def _closing_price_on_or_before(hist, target_date, fallback):
         return fallback
     return prior_rows['Close'].iloc[-1]
 
+def format_performance(total_cost, current_total_value, yesterday_total_value, ytd_start_total_value, year_start_total_value):
+    """Compute daily/YTD/1Y/total performance and format the ticker string.
+
+    Pure function (no I/O): all inputs are already-aggregated portfolio
+    totals in the same currency (EUR), which makes it testable without
+    mocking yfinance.
+    """
+    if total_cost == 0:
+        return "ETF: Error"
+
+    daily_net = current_total_value - yesterday_total_value
+    daily_perc = (daily_net / yesterday_total_value) * 100 if yesterday_total_value != 0 else 0
+    ytd_net = current_total_value - ytd_start_total_value
+    ytd_perc = (ytd_net / ytd_start_total_value) * 100 if ytd_start_total_value != 0 else 0
+    year_net = current_total_value - year_start_total_value
+    year_perc = (year_net / year_start_total_value) * 100 if year_start_total_value != 0 else 0
+    total_net = current_total_value - total_cost
+    total_perc = (total_net / total_cost) * 100 if total_cost != 0 else 0
+
+    d_icon = "▲" if daily_net >= 0 else "▼"
+    ytd_icon = "▲" if ytd_net >= 0 else "▼"
+    y_icon = "▲" if year_net >= 0 else "▼"
+    t_icon = "▲" if total_net >= 0 else "▼"
+
+    return (
+        f"1D: {d_icon} {daily_perc:.2f}% ({daily_net:+.2f}€) | "
+        f"YTD: {ytd_icon} {ytd_perc:.2f}% ({ytd_net:+.2f}€) | "
+        f"1Y: {y_icon} {year_perc:.2f}% ({year_net:+.2f}€) | "
+        f"T: {t_icon} {total_perc:.2f}% ({total_net:.2f}€)"
+    )
+
 def get_performance():
     MY_PORTFOLIO = load_portfolio()
     total_cost = 0
@@ -100,28 +131,13 @@ def get_performance():
         except Exception:
             continue
 
-    if total_cost == 0: return "ETF: Error"
-
-    # Final calculations
-    # Daily
-    daily_net = current_total_value - yesterday_total_value
-    daily_perc = (daily_net / yesterday_total_value) * 100 if yesterday_total_value != 0 else 0
-    # YTD
-    ytd_net = current_total_value - ytd_start_total_value
-    ytd_perc = (ytd_net / ytd_start_total_value) * 100 if ytd_start_total_value != 0 else 0
-    # Trailing 1-year (365 days)
-    year_net = current_total_value - year_start_total_value
-    year_perc = (year_net / year_start_total_value) * 100 if year_start_total_value != 0 else 0
-    # Total
-    total_net = current_total_value - total_cost
-    total_perc = (total_net / total_cost) * 100 if total_cost != 0 else 0
-
-    t_icon = "▲" if total_net >= 0 else "▼"
-    d_icon = "▲" if daily_net >= 0 else "▼"
-    ytd_icon = "▲" if ytd_net >= 0 else "▼"
-    y_icon = "▲" if year_net >= 0 else "▼"
-
-    return f"1D: {d_icon} {daily_perc:.2f}% ({daily_net:+.2f}€) | YTD: {ytd_icon} {ytd_perc:.2f}% ({ytd_net:+.2f}€) | 1Y: {y_icon} {year_perc:.2f}% ({year_net:+.2f}€) | T: {t_icon} {total_perc:.2f}% ({total_net:.2f}€)"
+    return format_performance(
+        total_cost,
+        current_total_value,
+        yesterday_total_value,
+        ytd_start_total_value,
+        year_start_total_value,
+    )
 
 if __name__ == "__main__":
     try:
