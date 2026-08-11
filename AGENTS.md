@@ -31,21 +31,24 @@ in mind when adding or editing any comment or doc file.
 - `myfinancialticker.py` — the entire application logic (see below).
 - `conftest.py` — makes `myfinancialticker` importable from `tests/`
   regardless of how pytest is invoked.
-- `tests/test_myfinancialticker.py` — pytest suite for `load_portfolio`,
-  `format_performance`, and `_closing_price_on_or_before`. Network-free.
+- `tests/test_myfinancialticker.py` — pytest suite covering every function,
+  including `get_performance()` and `main()` via a `_FakeTicker` stand-in for
+  `yf.Ticker`. Network-free; 100% line and branch coverage.
+- `pyproject.toml` — pytest/coverage config: every `pytest` run measures
+  coverage and fails if it drops below 95%.
 - `portfolio.json.example` — example portfolio config showing the expected format.
 - `portfolio.json` — the user's real portfolio data. **Gitignored** — contains
   personal financial data, never commit it.
 - `README.md` — user-facing documentation (installation, configuration, usage).
 - `requirements.txt` — pinned runtime dependencies (`yfinance`, `pandas`).
-- `requirements-dev.txt` — runtime dependencies plus `pytest`, for running the
-  test suite.
+- `requirements-dev.txt` — runtime dependencies plus `pytest`/`pytest-cov`,
+  for running the test suite with coverage.
 - `venv/` — local virtualenv. Not part of the project source; ignore it when
   exploring or editing code, and never commit it.
 
 ## How it works
 
-`myfinancialticker.py` has four functions:
+`myfinancialticker.py` has five functions:
 
 - `load_portfolio(filename="portfolio.json")` — loads the portfolio JSON,
   resolving the path relative to the script's own location (not the current
@@ -114,9 +117,12 @@ in mind when adding or editing any comment or doc file.
     whole request per ticker. Don't add back a `fast_info` access for
     `last_price`/`regular_market_previous_close`.
 
-`__main__` calls `get_performance()` and prints the result, wrapped in a
-generic try/except so the script never crashes with a traceback (important
-since it runs inside status bar widgets).
+- `main()` — calls `get_performance()` and prints the result, wrapped in a
+  generic try/except so the script never crashes with a traceback (important
+  since it runs inside status bar widgets). Called from the
+  `if __name__ == "__main__":` guard, which is excluded from coverage
+  (`# pragma: no cover`) since it contains no logic beyond that call —
+  `main()` itself is covered directly in tests.
 
 ## Portfolio data format
 
@@ -163,18 +169,20 @@ pip install -r requirements.txt
 python myfinancialticker.py
 ```
 
-Run the test suite (no network access required):
+Run the test suite (no network access required — `yf.Ticker` is mocked via
+`_FakeTicker` in `tests/test_myfinancialticker.py`, including for
+`get_performance()` and `main()`):
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-There is no linter configured. The pure logic (`format_performance`,
-`_closing_price_on_or_before`, `load_portfolio`) is covered by
-`tests/test_myfinancialticker.py`; the network-dependent orchestration in
-`get_performance()` is not covered by automated tests and should be verified
-by running the script directly.
+Every run measures coverage and fails if it drops below 95% (see
+`pyproject.toml`); the suite currently reaches 100%. There is no linter
+configured. When adding logic to `get_performance()`, extend the
+`_FakeTicker`-based tests rather than skipping coverage for it — real
+Yahoo Finance calls should never run in the test suite.
 
 ## What NOT to do
 
