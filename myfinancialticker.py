@@ -6,7 +6,10 @@ import sys
 import os
 from datetime import date, timedelta
 
-warnings.filterwarnings("ignore")
+# Silence noisy library warnings from yfinance/pandas; real errors still
+# propagate as exceptions and are not affected by this filter.
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 def load_portfolio(filename="portfolio.json"):
@@ -35,7 +38,7 @@ def get_performance():
     # We use the special ticker 'EURUSD=X'
     try:
         usd_eur_rate = 1 / yf.Ticker("EURUSD=X").fast_info['last_price']
-    except:
+    except Exception:
         usd_eur_rate = 0.92  # Manual fallback if the exchange rate fetch fails
 
     # Get the last trading day of the previous year
