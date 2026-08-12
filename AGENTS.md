@@ -110,28 +110,74 @@ in mind when adding or editing any comment or doc file.
 - `get_performance()` — the I/O-heavy orchestration:
   1. Fetches the EUR/USD exchange rate via `yf.Ticker("EURUSD=X")`, falling
      back to a hardcoded `0.92` if the fetch fails.
-  2. Determines the last trading day of the previous year (for YTD) and the
-     dates 5 days ago, 30 days ago, and 365 days ago (for the 5D, 1M, and
-     trailing 1-year metrics).
+  2. Computes an initial (system-date-based) *hint* for the last trading day
+     of the previous year, and for 5/30/365 days ago, used only to size the
+     `history()` fetch window below — see the per-ticker `effective_today`
+     step for why these aren't the values actually used for lookups.
   3. For each ticker in the portfolio (`{"TICKER": [[shares, cost,
-     purchase_date], ...]}`), makes **3** requests to Yahoo Finance:
+     purchase_date], ...]}`), makes **3** requests to Yahoo Finance in the
+     normal case (see below for when a 4th is added):
      - **One** daily `history()` call per ticker, with a window that covers
-       all reference dates (5D, 1M, YTD start, and 1-year-ago). Current price
-       and previous close are read from this same DataFrame's last two rows
-       (`hist['Close'].iloc[-1]`/`[-2]`) — verified to be byte-identical to
-       `fast_info`'s `last_price`/`regular_market_previous_close`. `1M`/`YTD`/
-       `1Y` reference prices come from `_closing_price_on_or_before`; `5D`'s
-       reference *date* comes from `_n_trading_sessions_ago` instead (see
-       above for why).
-     - **One** `fast_info` access, used only for `currency` — `fast_info`
-       alone costs 2 requests when `last_price`/`regular_market_previous_close`
-       are also read, so those fields are deliberately *not* read from it
-       anymore.
+       all reference dates (5D, 1M, YTD start, and 1-year-ago).
+     - **One** `fast_info` access, used for `currency` and, when needed, as
+       a fallback quote (see below).
      - **One** short-range `history(interval="1h")` call, used only to
        refine `5D`'s reference *price* via `_last_intraday_close` once its
        date is known (see above). Wrapped in its own `try`/`except`, falling
        back to the daily-close price on failure, so a hiccup here degrades
        `5D`'s precision rather than dropping the ticker from every metric.
+
+     **Handling Yahoo's not-yet-settled last bar.** Yahoo sometimes returns
+     the most recent row of `history()` with `Close` (and the rest of OHLC)
+     as `NaN`, while `Volume` is already populated and matches
+     `fast_info`'s `lastVolume` exactly — confirmed live. This happens both
+     while a session is still in progress and, more commonly for this
+     project's timezone, right after a session has *fully* closed but
+     Yahoo's backend hasn't backfilled the official close yet. Silently
+     reading that `NaN` as `current_price` previously propagated `NaN`
+     through every output field without raising (NaN isn't an exception),
+     bypassing the per-ticker `except: continue` guard entirely. The fix:
+     - `valid_hist = hist.dropna(subset=['Close'])` is used for every "last
+       known close" lookup (`_closing_price_on_or_before`,
+       `_n_trading_sessions_ago`) instead of raw `hist`, so the unsettled
+       row is never mistaken for a real trading session. If `valid_hist` is
+       empty, the ticker raises and is skipped, same as an outright
+       `history()` failure.
+     - If `hist`'s last row **is** valid, `current_price`/`prev_close` are
+       read from `hist['Close'].iloc[-1]`/`valid_hist['Close'].iloc[-2]` as
+       before — verified byte-identical to `fast_info`'s `last_price`/
+       `regular_market_previous_close`.
+     - If it's **not** valid, `current_price` falls back to
+       `ticker.fast_info['last_price']` (this is the 4th request — it's
+       already-cached `fast_info` data being re-read, not a new fetch, so
+       it doesn't add a network round-trip) and `prev_close` becomes
+       `valid_hist['Close'].iloc[-1]` — the last *complete* session, which
+       is already correctly positioned since the unsettled row was dropped.
+       **Must use `ticker.fast_info['last_price']` (bracket access), never
+       `.get('last_price')`**: `FastInfo.get()` only recognizes its
+       camelCase key names (`'lastPrice'`) and silently returns `None` for
+       the documented snake_case alias that `__getitem__` accepts —
+       confirmed against the real yfinance API, not just its docs. This
+       bug shipped once already because the test suite's `_FakeTicker` used
+       a plain dict, whose `.get()` doesn't share this quirk — don't rely
+       on `.get()` semantics matching between the fake and the real
+       `FastInfo` object.
+     - `_n_trading_sessions_ago`'s session count also shifts by one in this
+       branch: `valid_hist`'s last row is one session *before* the "today"
+       that `current_price` now represents (since that unsettled row was
+       excluded from `valid_hist` entirely), so counting "5 sessions ago"
+       from `valid_hist` only needs 4 more steps back, not 5.
+     - Every reference date (`yesterday`, `five_days_ago`, `one_month_ago`,
+       `one_year_ago`, `last_day_of_prev_year`) is computed per-ticker from
+       `effective_today = hist.index[-1].date()` — the date Yahoo's own
+       data actually reflects — rather than from the system-date hints
+       computed in step 2. Diagnosed by comparing output against Yahoo's
+       actual figures: using the system date directly could put
+       `effective_today` a full calendar day ahead of the session Yahoo's
+       data was anchored to, which silently shifted every lookback window
+       by a day and was large enough to visibly skew `1M`/`5D` (a 1-day
+       shift across a weekend swaps which trading session gets used
+       entirely, not just a small date offset).
      - Converts USD-denominated prices to EUR using the fetched rate. Lot
        costs are never converted — they're what was actually paid, already
        in EUR.
@@ -175,8 +221,11 @@ in mind when adding or editing any comment or doc file.
   - `fast_info` internally makes a separate request for `last_price`/
     `regular_market_previous_close` beyond its basic per-ticker request —
     hence deriving those two fields from `history()` instead removes a
-    whole request per ticker. Don't add back a `fast_info` access for
-    `last_price`/`regular_market_previous_close`.
+    whole request per ticker in the normal case. Don't unconditionally read
+    `last_price`/`regular_market_previous_close` from `fast_info` — the one
+    exception is the narrow, conditional fallback described above, used
+    only when `history()`'s last row is unusable, which most runs never
+    hit.
 
 - `main()` — calls `get_performance()` and prints the result, wrapped in a
   generic try/except so the script never crashes with a traceback (important
@@ -227,12 +276,15 @@ see "How it works" above.
   values when the live rate fetch fails.
 - **Keep network calls per ticker to a minimum.** Yahoo Finance rate-limits
   (HTTP 429) have been observed in practice; `get_performance()` makes 3
-  requests per ticker (daily `history()`, `fast_info` for `currency`, and a
-  short-range hourly `history()` for `5D` precision — see "How it works").
-  The 3rd request was added deliberately, as a known, accepted trade-off
-  for matching Yahoo's `5D` figure exactly; don't add further requests
-  without calling out the same trade-off explicitly. Prefer adding logic to
-  the existing pure helpers (`_closing_price_on_or_before`,
+  requests per ticker in the normal case (daily `history()`, `fast_info`
+  for `currency`, and a short-range hourly `history()` for `5D` precision
+  — see "How it works"), plus a conditional 4th re-read of the
+  already-fetched `fast_info` object (no extra round-trip) when the daily
+  `history()` call's last row is unusable. The 3rd request was added
+  deliberately, as a known, accepted trade-off for matching Yahoo's `5D`
+  figure exactly; don't add further *unconditional* requests without
+  calling out the same trade-off explicitly. Prefer adding logic to the
+  existing pure helpers (`_closing_price_on_or_before`,
   `_n_trading_sessions_ago`, `_last_intraday_close`, `_value_as_of`,
   `format_performance`) over adding new network calls.
 
