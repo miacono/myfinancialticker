@@ -168,23 +168,20 @@ def get_performance() -> str:
     except Exception:
         usd_eur_rate = 0.92  # Manual fallback if the exchange rate fetch fails
 
-    # Get the last trading day of the previous year
+    # System "today", used only to size the history() fetch window below.
+    # The actual reference dates (yesterday/5D/1M/YTD/1Y anchors) are
+    # computed per-ticker from `effective_today` further down instead of
+    # from this value directly — see the comment there for why.
     today = date.today()
-    yesterday = today - timedelta(days=1)
-    last_day_of_prev_year = date(today.year - 1, 12, 31)
-    # Calendar-day approximation of the trailing 5-day reference date. Only
-    # used to size the history() fetch window and as a fallback when a
-    # ticker's history is too short for _n_trading_sessions_ago to count
-    # back 5 actual sessions; the real 5D reference is trading-session
-    # based (see _n_trading_sessions_ago).
-    five_days_ago = today - timedelta(days=5)
-    # Reference date for the trailing 1-month performance (30 days ago)
-    one_month_ago = today - timedelta(days=30)
-    # Reference date for the trailing 1-year performance (365 days ago)
-    one_year_ago = today - timedelta(days=365)
+    last_day_of_prev_year_hint = date(today.year - 1, 12, 31)
+    five_days_ago_hint = today - timedelta(days=5)
+    one_month_ago_hint = today - timedelta(days=30)
+    one_year_ago_hint = today - timedelta(days=365)
     # Earliest date we need historical data for, so the 5D, 1M, YTD, and
     # 1-year reference prices can all be read from a single history() call.
-    earliest_target_date = min(last_day_of_prev_year, one_year_ago, one_month_ago, five_days_ago)
+    earliest_target_date = min(
+        last_day_of_prev_year_hint, one_year_ago_hint, one_month_ago_hint, five_days_ago_hint
+    )
 
     for symbol, lots in portfolio.items():
         try:
@@ -198,23 +195,74 @@ def get_performance() -> str:
             # even if the exact target date falls on a weekend/holiday.
             hist = ticker.history(start=earliest_target_date - timedelta(days=7), end=today + timedelta(days=1))
 
-            # Read current price and previous close from this same history
-            # window instead of a separate fast_info call: the last row is
-            # today's (still-forming) session and the second-to-last row is
-            # the last completed session, matching fast_info's `last_price`
-            # and `regular_market_previous_close` exactly. fast_info is only
-            # used below for `currency`, which the history response doesn't
-            # carry. This keeps requests at 2 per ticker for `1M`/`YTD`/`1Y`
-            # (fast_info alone costs 2 requests; history() costs 1); `5D`
-            # below adds a 3rd, smaller request for hourly data.
-            current_price = hist['Close'].iloc[-1]
-            prev_close = hist['Close'].iloc[-2] if len(hist) >= 2 else current_price
+            # Yahoo sometimes returns the most recent row (the still-forming
+            # session) with NaN OHLC while Volume is already populated —
+            # confirmed live: the NaN row's Volume matches fast_info's
+            # lastVolume exactly, so the bar just hasn't been finalized yet.
+            # Filter those rows out before using `hist` for any "last known
+            # close" lookup, so an incomplete session is never mistaken for
+            # a real trading day.
+            valid_hist = hist.dropna(subset=['Close'])
+            if valid_hist.empty:
+                raise ValueError(f"no valid closing prices for {symbol}")
 
             # Ticker's currency (e.g., 'EUR' or 'USD')
             currency = ticker.fast_info.get('currency', 'EUR')
 
+            # Read current price from this same history window instead of a
+            # separate fast_info call, matching fast_info's `last_price`
+            # exactly when today's bar is finalized.
+            today_bar_is_valid = not pd.isna(hist['Close'].iloc[-1])
+            if today_bar_is_valid:
+                current_price = hist['Close'].iloc[-1]
+                # valid_hist's last row *is* today here, so the prior
+                # session is one row back, and "5 sessions ago" is counted
+                # from today itself (n=5).
+                prev_close = valid_hist['Close'].iloc[-2] if len(valid_hist) >= 2 else current_price
+                five_days_session_offset = 5
+            else:
+                # Today's bar hasn't settled yet (NaN Close, see above).
+                # Prefer fast_info's live quote for "current" — already
+                # fetched for `currency` above, so this costs no extra
+                # request. NOTE: must use `[...]`, not `.get(...)`:
+                # FastInfo.get() only recognizes its camelCase key names
+                # ('lastPrice'), and silently returns None for the
+                # documented snake_case alias ('last_price') that
+                # `__getitem__` accepts — confirmed against the real
+                # yfinance API, not just its docs.
+                try:
+                    current_price = ticker.fast_info['last_price']
+                    if pd.isna(current_price):
+                        raise ValueError
+                except Exception:
+                    current_price = valid_hist['Close'].iloc[-1]
+                # The incomplete/not-yet-backfilled session was already
+                # filtered out of valid_hist, so its last row is already
+                # the last *complete* session — no extra step back needed.
+                prev_close = valid_hist['Close'].iloc[-1]
+                # "Today" (whose live price we're using above) isn't a row
+                # in valid_hist at all, so it only takes 4 more steps back
+                # from valid_hist's last row to reach "5 sessions before
+                # today" — one less than in the branch above.
+                five_days_session_offset = 4
+
+            # "Effective today": the most recent session Yahoo's data
+            # actually reflects for this ticker. This can lag the raw
+            # system date — either the exchange's timezone differs from
+            # the system's, or (the common case here) Yahoo just hasn't
+            # backfilled the latest completed session's Close yet (see the
+            # NaN handling above). Anchoring every reference-date lookup to
+            # this instead of system `today` keeps them aligned with
+            # whichever price is being treated as "current" above.
+            effective_today = hist.index[-1].date()
+            yesterday = effective_today - timedelta(days=1)
+            five_days_ago = effective_today - timedelta(days=5)
+            one_month_ago = effective_today - timedelta(days=30)
+            one_year_ago = effective_today - timedelta(days=365)
+            last_day_of_prev_year = date(effective_today.year - 1, 12, 31)
+
             five_days_start_date, five_days_start_price = _n_trading_sessions_ago(
-                hist, 5, five_days_ago, prev_close
+                valid_hist, five_days_session_offset, five_days_ago, prev_close
             )
             # Refine the 5D reference price with an intraday (hourly) fetch:
             # Yahoo's own `5D` anchors to the last intraday trade before the
@@ -232,9 +280,9 @@ def get_performance() -> str:
                 hourly_hist = pd.DataFrame()
             five_days_start_price = _last_intraday_close(hourly_hist, five_days_start_date, five_days_start_price)
 
-            one_month_start_price = _closing_price_on_or_before(hist, one_month_ago, prev_close)
-            ytd_start_price = _closing_price_on_or_before(hist, last_day_of_prev_year, prev_close)
-            year_start_price = _closing_price_on_or_before(hist, one_year_ago, prev_close)
+            one_month_start_price = _closing_price_on_or_before(valid_hist, one_month_ago, prev_close)
+            ytd_start_price = _closing_price_on_or_before(valid_hist, last_day_of_prev_year, prev_close)
+            year_start_price = _closing_price_on_or_before(valid_hist, one_year_ago, prev_close)
 
             # 2. If the data is in USD, convert it to EUR. Lot costs are
             # never converted: they're what you actually paid, already in EUR.

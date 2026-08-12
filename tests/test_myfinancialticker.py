@@ -382,6 +382,142 @@ def test_get_performance_single_row_history_uses_current_price_as_prev_close(mon
     assert "1D: ▲ 0.00%" in result
 
 
+def test_get_performance_falls_back_to_fast_info_when_todays_close_is_nan(monkeypatch):
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    # Today's bar hasn't settled yet: Close is NaN even though Yahoo already
+    # reports a live quote via fast_info.
+    hist = _hist_df([yesterday, today], [10.0, float("nan")])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "LIVE": {"fast_info": {"currency": "EUR", "last_price": 12.5}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"LIVE": [[1, 9.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    expected = mft.format_performance(9.0, 12.5, 10.0, 10.0, 10.0, 10.0, 10.0)
+
+    assert result == expected
+
+
+def test_get_performance_falls_back_to_last_valid_close_when_fast_info_price_missing(monkeypatch):
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    hist = _hist_df([yesterday, today], [10.0, float("nan")])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        # fast_info has no 'last_price' key at all, simulating a quote fetch
+        # that doesn't carry a live price either.
+        "STALE": {"fast_info": {"currency": "EUR"}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"STALE": [[1, 9.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    # Falls all the way back to the last known valid close (10.0), so 1D
+    # reads flat instead of propagating NaN.
+    expected = mft.format_performance(9.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0)
+
+    assert result == expected
+
+
+def test_get_performance_falls_back_to_last_valid_close_when_fast_info_price_is_nan(monkeypatch):
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    hist = _hist_df([yesterday, today], [10.0, float("nan")])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        # fast_info carries the key but its value is itself NaN (e.g. a
+        # quote endpoint glitch), distinct from the key being absent.
+        "GLITCHY": {"fast_info": {"currency": "EUR", "last_price": float("nan")}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"GLITCHY": [[1, 9.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    expected = mft.format_performance(9.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0)
+
+    assert result == expected
+
+
+def test_get_performance_5d_counts_sessions_from_effective_today_when_last_close_is_nan(monkeypatch):
+    # 8 real trading sessions (Mon-Thu, Mon-Thu), followed by a 9th
+    # (Fri) whose bar hasn't settled yet (NaN Close) -- mirrors the real
+    # Yahoo behavior this whole NaN-handling path was built for.
+    valid_dates = [
+        "2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30",  # Mon-Thu
+        "2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06",  # Mon-Thu
+    ]
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0]
+    hist = _hist_df(valid_dates + ["2026-08-07"], closes + [float("nan")])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "NEW": {"fast_info": {"currency": "EUR", "last_price": 110.0}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"NEW": [[1, 90.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    # "Effective today" is 2026-08-07 (the NaN row's date), so "5 sessions
+    # ago" must count back from there, not from 2026-08-06 (valid_hist's
+    # last row) -- landing on 2026-07-30 (103.0), one session earlier than
+    # a naive count from valid_hist's last row would give.
+    # 1M/YTD/1Y all reach further back than this short history covers, so
+    # _closing_price_on_or_before falls back to prev_close (107.0) for all
+    # three -- the lot itself was bought in 2000, so it's priced at
+    # whatever market price is passed in, not at cost.
+    expected = mft.format_performance(
+        total_cost=90.0,
+        current_total_value=110.0,
+        yesterday_total_value=107.0,  # last known valid close (2026-08-06)
+        five_days_start_total_value=103.0,
+        one_month_start_total_value=107.0,
+        ytd_start_total_value=107.0,
+        year_start_total_value=107.0,
+    )
+
+    assert result == expected
+
+
+def test_get_performance_skips_ticker_with_all_nan_history(monkeypatch):
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    good_hist = _hist_df([yesterday, today], [10.0, 12.0])
+    all_nan_hist = _hist_df([yesterday, today], [float("nan"), float("nan")])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "GOOD": {"fast_info": {"currency": "EUR"}, "history": good_hist},
+        "EMPTY": {"fast_info": {"currency": "EUR"}, "history": all_nan_hist},
+    }
+    monkeypatch.setattr(
+        mft,
+        "load_portfolio",
+        lambda: {
+            "GOOD": [[1, 9.0, _LONG_AGO]],
+            "EMPTY": [[1, 9.0, _LONG_AGO]],
+        },
+    )
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    # EMPTY has no valid closing prices at all, so it's skipped entirely,
+    # the same way a ticker whose history() call raises is skipped.
+    expected = mft.format_performance(9.0, 12.0, 10.0, 10.0, 10.0, 10.0, 10.0)
+
+    assert result == expected
+
+
 def test_get_performance_multiple_lots_value_correctly_by_purchase_date(monkeypatch):
     today = date.today()
     first_purchase_date = today - timedelta(days=200)
