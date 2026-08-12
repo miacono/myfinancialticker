@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import warnings
 import json
+import logging
 import sys
 import os
 from datetime import date, timedelta
@@ -10,6 +11,11 @@ from datetime import date, timedelta
 # propagate as exceptions and are not affected by this filter.
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Diagnostic logging only: goes to stderr (or nowhere, by default logging
+# config), never stdout, since stdout must stay the single-line ticker
+# output that status bars render verbatim.
+logger = logging.getLogger(__name__)
 
 
 def load_portfolio(filename: str = "portfolio.json") -> dict[str, list[list]]:
@@ -27,35 +33,68 @@ def load_portfolio(filename: str = "portfolio.json") -> dict[str, list[list]]:
         sys.exit(f"Error: The file '{config_path}' is not a valid JSON.")
 
 
-def _closing_price_on_or_before(hist: pd.DataFrame, target_date: date, fallback: float) -> float:
+def _closing_price_on_or_before(
+    hist: pd.DataFrame, target_date: date, fallback: float, strictly_before: bool = False
+) -> float:
     """Return the last closing price in `hist` on or before `target_date`.
 
-    Falls back to `fallback` if `hist` is empty or has no rows on or
-    before `target_date`.
+    Falls back to `fallback` if `hist` is empty or has no matching rows.
+
+    `strictly_before=True` excludes `target_date` itself, returning the
+    close of the session immediately preceding it instead. Used for the
+    1M/YTD/1Y reference prices: those `target_date`s are calendar-day
+    approximations of "N ago" that stand for the *start* of that trailing
+    window, not its own end — confirmed against Yahoo's own portfolio
+    baseline for 1M, whose reference price is the prior session's close
+    even though the calendar-approximated date itself is a real trading
+    day with its own close. This mirrors how 5D's reference date is
+    already the session *before* the first day of the measured window
+    (see `_n_trading_sessions_ago`), just reached via a calendar
+    approximation here instead of exact session counting. The default
+    (`False`, on-or-before) stays as-is for resolving an *already*
+    precisely-known session's price (`_n_trading_sessions_ago`'s internal
+    use), where a NaN close should fall back to the latest prior valid
+    one but a valid close on that exact session must still win.
     """
     if hist.empty:
         return fallback
-    prior_rows = hist[hist.index.date <= target_date]
+    if strictly_before:
+        prior_rows = hist[hist.index.date < target_date]
+    else:
+        prior_rows = hist[hist.index.date <= target_date]
     if prior_rows.empty:
         return fallback
     return prior_rows['Close'].iloc[-1]
 
 
 def _n_trading_sessions_ago(
-    hist: pd.DataFrame, n: int, fallback_date: date, fallback_price: float
+    hist: pd.DataFrame, valid_hist: pd.DataFrame, n: int, fallback_date: date, fallback_price: float
 ) -> tuple[date, float]:
-    """Return the (date, closing price) of the trading session `n` sessions before the most recent row in `hist`.
+    """Return the (date, closing price) of the trading session `n` sessions before the most recent completed session in `hist`.
 
-    Falls back to `(fallback_date, fallback_price)` if `hist` has `n` rows
-    or fewer. Used for `5D`: Yahoo Finance counts trading sessions, not
-    calendar days, and a plain 5-calendar-day lookback often only spans
-    3-4 actual sessions once a weekend is in the window, understating a
-    period this short far more than it does the longer ones.
+    Falls back to `(fallback_date, fallback_price)` if fewer than `n` prior
+    sessions are available. Used for `5D`: Yahoo Finance counts trading
+    sessions, not calendar days, and a plain 5-calendar-day lookback often
+    only spans 3-4 actual sessions once a weekend is in the window,
+    understating a period this short far more than it does the longer ones.
+
+    Session *positions* are counted against `hist` with only a trailing run
+    of NaN-close rows trimmed (an unsettled "today" bar) — not every NaN
+    row, as `valid_hist` does. Yahoo occasionally comes back with a NaN
+    close for an *interior* day, not just the still-forming last bar;
+    silently excluding that day from the count (as counting against
+    `valid_hist` would) shifts every session position one day too far back.
+    Once the target session's date is found this way, its actual price is
+    read from `valid_hist` via `_closing_price_on_or_before`, which falls
+    back to the latest valid close before that date if the target
+    session's own close is itself the NaN one.
     """
-    if len(hist) <= n:
+    last_valid_idx = hist['Close'].last_valid_index()
+    session_calendar = hist.loc[:last_valid_idx] if last_valid_idx is not None else hist.iloc[0:0]
+    if len(session_calendar) <= n:
         return fallback_date, fallback_price
-    row = hist.iloc[-(n + 1)]
-    return row.name.date(), row['Close']
+    target_date = session_calendar.index[-(n + 1)].date()
+    return target_date, _closing_price_on_or_before(valid_hist, target_date, fallback_price)
 
 
 def _last_intraday_close(hourly_hist: pd.DataFrame, target_date: date, fallback: float) -> float:
@@ -78,20 +117,58 @@ def _last_intraday_close(hourly_hist: pd.DataFrame, target_date: date, fallback:
     return day_rows['Close'].iloc[-1]
 
 
+def _fetch_regular_market_previous_close(ticker: yf.Ticker, symbol: str) -> float | None:
+    """Fetch Yahoo's official previous-close price via its live quote endpoint.
+
+    Returns `None` on any failure — network error, an unexpected response
+    shape, or the field itself being absent/NaN — so callers can fall back
+    to a chart-derived estimate.
+
+    This is a *different* data source from `history()`'s daily/hourly bars:
+    it's the exchange's official closing-auction price, straight from
+    Yahoo's live quote system. Confirmed live: for a session whose daily
+    bar Yahoo's chart endpoint returns as entirely NaN (a genuine data gap,
+    not a holiday — see the `keepna=True` comment in `get_performance()`),
+    this still returns the correct official close, while even an
+    hourly-bar-refined estimate for that same session was off by several
+    cents — hourly bars only capture continuous-trading prints, not the
+    closing auction that settles the official close.
+
+    Uses `yfinance`'s internal `Ticker._data` session (undocumented, but
+    it's the same session/cookie/crumb machinery every other call in this
+    module already goes through) to call Yahoo's `v7/finance/quote`
+    directly instead of the heavier public `Ticker.info` (which bundles in
+    a `quoteSummary` request this module has no other use for).
+    """
+    try:
+        response = ticker._data.get_raw_json(
+            "https://query1.finance.yahoo.com/v7/finance/quote", params={"symbols": symbol}
+        )
+        value = response["quoteResponse"]["result"][0]["regularMarketPreviousClose"]
+        return None if pd.isna(value) else float(value)
+    except Exception:
+        return None
+
+
 def _value_as_of(lots: list[list], target_date: date, market_price: float) -> float:
     """Value a ticker's lots as they stood on `target_date`.
 
-    Lots already purchased on or before `target_date` are valued at
-    `market_price` (what they were actually worth then). Lots purchased
-    after `target_date` didn't exist yet as of that date, so they're valued
-    at their own purchase cost instead — otherwise a period would price
-    shares you didn't own yet using a today's-quantity-times-past-price
-    shortcut, overstating or understating how much the portfolio was
-    really worth at that point in time.
+    `target_date` is a *start-of-period* anchor (yesterday, 5D/1M/YTD/1Y
+    ago) — the baseline a period's growth is measured from, not its end.
+    Lots already purchased strictly before `target_date` are valued at
+    `market_price` (what they were actually worth then). Lots purchased on
+    or after `target_date` didn't yet form part of that baseline — a
+    purchase made on that exact date is part of what happened *during* the
+    period being measured, not before it — so they're valued at their own
+    purchase cost instead. Otherwise a period would price shares you didn't
+    hold yet as part of the baseline, overstating it and understating the
+    period's real gain. Confirmed against Yahoo's own portfolio baseline
+    for a purchase landing exactly on a reference date: Yahoo excludes it
+    the same way.
     """
     total = 0.0
     for shares, cost, purchase_date in lots:
-        if date.fromisoformat(purchase_date) <= target_date:
+        if date.fromisoformat(purchase_date) < target_date:
             total += shares * market_price
         else:
             total += shares * cost
@@ -167,6 +244,7 @@ def get_performance() -> str:
         usd_eur_rate = 1 / yf.Ticker("EURUSD=X").fast_info['last_price']
     except Exception:
         usd_eur_rate = 0.92  # Manual fallback if the exchange rate fetch fails
+        logger.warning("EUR/USD rate fetch failed, using fallback %.2f", usd_eur_rate, exc_info=True)
 
     # System "today", used only to size the history() fetch window below.
     # The actual reference dates (yesterday/5D/1M/YTD/1Y anchors) are
@@ -193,12 +271,24 @@ def get_performance() -> str:
             # start and 1-year-ago), instead of one history() call per
             # date. Starts 7 days early so a valid trading day is found
             # even if the exact target date falls on a weekend/holiday.
-            hist = ticker.history(start=earliest_target_date - timedelta(days=7), end=today + timedelta(days=1))
+            # keepna=True: without it, yfinance silently *drops* any row
+            # where every OHLC+Volume field is null instead of returning it
+            # with a NaN Close — confirmed live for a genuine mid-week
+            # trading session (not a holiday) that Yahoo just hadn't
+            # backfilled yet. A dropped row disappears from `hist`'s index
+            # entirely, which would make `_n_trading_sessions_ago`'s
+            # position-based counting (further down) silently skip that
+            # session and land one day too far back — keepna=True keeps the
+            # row (as NaN) so that counting stays accurate.
+            hist = ticker.history(
+                start=earliest_target_date - timedelta(days=7), end=today + timedelta(days=1), keepna=True
+            )
 
-            # Yahoo sometimes returns the most recent row (the still-forming
-            # session) with NaN OHLC while Volume is already populated —
-            # confirmed live: the NaN row's Volume matches fast_info's
-            # lastVolume exactly, so the bar just hasn't been finalized yet.
+            # Yahoo sometimes returns a row (the still-forming latest
+            # session, or an as-yet-unbackfilled earlier one) with NaN OHLC
+            # while Volume is already populated — confirmed live: the NaN
+            # row's Volume matches fast_info's lastVolume exactly for the
+            # still-forming case, so the bar just hasn't been finalized yet.
             # Filter those rows out before using `hist` for any "last known
             # close" lookup, so an incomplete session is never mistaken for
             # a real trading day.
@@ -215,10 +305,10 @@ def get_performance() -> str:
             today_bar_is_valid = not pd.isna(hist['Close'].iloc[-1])
             if today_bar_is_valid:
                 current_price = hist['Close'].iloc[-1]
-                # valid_hist's last row *is* today here, so the prior
-                # session is one row back, and "5 sessions ago" is counted
-                # from today itself (n=5).
-                prev_close = valid_hist['Close'].iloc[-2] if len(valid_hist) >= 2 else current_price
+                # The session calendar's last entry *is* today here, so the
+                # prior session is one step back, and "5 sessions ago" is
+                # counted from today itself (n=5).
+                prev_close_session_offset = 1
                 five_days_session_offset = 5
             else:
                 # Today's bar hasn't settled yet (NaN Close, see above).
@@ -237,12 +327,13 @@ def get_performance() -> str:
                 except Exception:
                     current_price = valid_hist['Close'].iloc[-1]
                 # The incomplete/not-yet-backfilled session was already
-                # filtered out of valid_hist, so its last row is already
-                # the last *complete* session — no extra step back needed.
-                prev_close = valid_hist['Close'].iloc[-1]
-                # "Today" (whose live price we're using above) isn't a row
-                # in valid_hist at all, so it only takes 4 more steps back
-                # from valid_hist's last row to reach "5 sessions before
+                # excluded from the session calendar's trailing edge (see
+                # _n_trading_sessions_ago), so its last entry is already the
+                # last *complete* session — no extra step back needed.
+                prev_close_session_offset = 0
+                # "Today" (whose live price we're using above) isn't a
+                # session in the calendar at all, so it only takes 4 more
+                # steps back from its last entry to reach "5 sessions before
                 # today" — one less than in the branch above.
                 five_days_session_offset = 4
 
@@ -255,34 +346,66 @@ def get_performance() -> str:
             # this instead of system `today` keeps them aligned with
             # whichever price is being treated as "current" above.
             effective_today = hist.index[-1].date()
-            yesterday = effective_today - timedelta(days=1)
             five_days_ago = effective_today - timedelta(days=5)
             one_month_ago = effective_today - timedelta(days=30)
             one_year_ago = effective_today - timedelta(days=365)
             last_day_of_prev_year = date(effective_today.year - 1, 12, 31)
 
-            five_days_start_date, five_days_start_price = _n_trading_sessions_ago(
-                valid_hist, five_days_session_offset, five_days_ago, prev_close
-            )
-            # Refine the 5D reference price with an intraday (hourly) fetch:
-            # Yahoo's own `5D` anchors to the last intraday trade before the
-            # window starts, which for low-volatility instruments can differ
-            # from the official daily close above by more than is
-            # proportionate for a period this short. This 3rd request is a
-            # small, short-range one (a handful of days of hourly bars, not
-            # the full 1M/YTD/1Y window), and falls back to the daily-close
-            # price above if it fails for any reason.
+            # Fetch intraday (hourly) data once, used to refine both
+            # yesterday's and 5D's reference prices below: Yahoo's own
+            # figures anchor to the last intraday trade at/before a
+            # session's edge, not always the official daily close
+            # `_n_trading_sessions_ago` reads from daily bars — and Yahoo
+            # occasionally has no daily bar at all for a session (a
+            # genuine data gap, confirmed live for an ordinary mid-week
+            # session, not a holiday) while still having hourly bars for
+            # it, so this also serves as the fallback price source when a
+            # session's daily close is missing entirely. This request is
+            # small and short-range (a handful of days of hourly bars, not
+            # the full 1M/YTD/1Y window), and both refinements below fall
+            # back to the daily-derived price if it fails for any reason.
             try:
                 hourly_hist = ticker.history(
                     start=today - timedelta(days=10), end=today + timedelta(days=1), interval="1h"
                 )
             except Exception:
                 hourly_hist = pd.DataFrame()
+                logger.debug("hourly history fetch failed for %s, using daily close instead", symbol, exc_info=True)
+
+            prev_close_date, prev_close = _n_trading_sessions_ago(
+                hist, valid_hist, prev_close_session_offset, effective_today - timedelta(days=1), current_price
+            )
+            prev_close = _last_intraday_close(hourly_hist, prev_close_date, prev_close)
+
+            # Prefer Yahoo's official previous-close (live quote endpoint)
+            # over the chart-derived estimate above: even hourly-refined,
+            # that estimate is the last *continuous-trading* print, not the
+            # closing-auction price Yahoo's own "Day Change" is anchored
+            # to — confirmed live, a multi-cent-per-share difference for
+            # these instruments. This directly fixes 1D; it also improves
+            # 5D/1M/YTD/1Y's fallback value below (used only when a
+            # ticker's history is too short to cover the full window), so
+            # there's no reason to keep the less accurate one around.
+            live_prev_close = _fetch_regular_market_previous_close(ticker, symbol)
+            if live_prev_close is not None:
+                prev_close = live_prev_close
+            else:
+                logger.debug("live previous-close fetch failed for %s, using chart-derived value", symbol)
+
+            five_days_start_date, five_days_start_price = _n_trading_sessions_ago(
+                hist, valid_hist, five_days_session_offset, five_days_ago, prev_close
+            )
             five_days_start_price = _last_intraday_close(hourly_hist, five_days_start_date, five_days_start_price)
 
-            one_month_start_price = _closing_price_on_or_before(valid_hist, one_month_ago, prev_close)
-            ytd_start_price = _closing_price_on_or_before(valid_hist, last_day_of_prev_year, prev_close)
-            year_start_price = _closing_price_on_or_before(valid_hist, one_year_ago, prev_close)
+            one_month_start_price = _closing_price_on_or_before(
+                valid_hist, one_month_ago, prev_close, strictly_before=True
+            )
+            ytd_start_price = _closing_price_on_or_before(
+                valid_hist, last_day_of_prev_year, prev_close, strictly_before=True
+            )
+            year_start_price = _closing_price_on_or_before(
+                valid_hist, one_year_ago, prev_close, strictly_before=True
+            )
 
             # 2. If the data is in USD, convert it to EUR. Lot costs are
             # never converted: they're what you actually paid, already in EUR.
@@ -296,12 +419,13 @@ def get_performance() -> str:
 
             total_cost += ticker_total_cost
             current_total_value += qty * current_price
-            yesterday_total_value += _value_as_of(lots, yesterday, prev_close)
+            yesterday_total_value += _value_as_of(lots, prev_close_date, prev_close)
             five_days_start_total_value += _value_as_of(lots, five_days_start_date, five_days_start_price)
             one_month_start_total_value += _value_as_of(lots, one_month_ago, one_month_start_price)
             ytd_start_total_value += _value_as_of(lots, last_day_of_prev_year, ytd_start_price)
             year_start_total_value += _value_as_of(lots, one_year_ago, year_start_price)
         except Exception:
+            logger.warning("skipping %s due to an error", symbol, exc_info=True)
             continue
 
     return format_performance(

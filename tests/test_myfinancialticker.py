@@ -22,7 +22,7 @@ class _FakeTicker:
             raise RuntimeError(f"forced fast_info failure for {self._symbol}")
         return self._config["fast_info"]
 
-    def history(self, start=None, end=None, interval=None):
+    def history(self, start=None, end=None, interval=None, keepna=None):
         if interval == "1h":
             if self._config.get("raise_on_hourly_history"):
                 raise RuntimeError(f"forced hourly history failure for {self._symbol}")
@@ -34,6 +34,26 @@ class _FakeTicker:
 
 def _hist_df(dates, closes):
     return pd.DataFrame({"Close": closes}, index=pd.to_datetime(dates))
+
+
+class _FakeYfData:
+    """Stand-in for yfinance's internal Ticker._data session."""
+
+    def __init__(self, response=None, raise_exc=False):
+        self._response = response
+        self._raise_exc = raise_exc
+
+    def get_raw_json(self, url, params=None):
+        if self._raise_exc:
+            raise RuntimeError("network down")
+        return self._response
+
+
+class _FakeTickerWithData:
+    """Minimal stand-in exposing only the `_data` attribute _fetch_regular_market_previous_close reads."""
+
+    def __init__(self, data):
+        self._data = data
 
 
 # A purchase date old enough to always be "held" as of any reference window
@@ -165,6 +185,33 @@ def test_closing_price_on_or_before_uses_fallback_when_history_empty():
     assert price == 999.0
 
 
+def test_closing_price_on_or_before_strictly_before_excludes_target_date():
+    # Regression test matching Yahoo's own 1M reference price: when
+    # target_date itself is a real trading session, strictly_before=True
+    # must still return the *prior* session's close, not that day's own --
+    # the calendar-approximated target_date represents the start of the
+    # trailing window, not its own end.
+    hist = pd.DataFrame(
+        {"Close": [10.0, 11.0, 12.0]},
+        index=pd.to_datetime(["2025-12-29", "2025-12-30", "2025-12-31"]),
+    )
+
+    price = mft._closing_price_on_or_before(hist, date(2025, 12, 31), fallback=999.0, strictly_before=True)
+
+    assert price == 11.0
+
+
+def test_closing_price_on_or_before_strictly_before_uses_fallback_when_no_earlier_row():
+    hist = pd.DataFrame(
+        {"Close": [10.0]},
+        index=pd.to_datetime(["2025-12-31"]),
+    )
+
+    price = mft._closing_price_on_or_before(hist, date(2025, 12, 31), fallback=999.0, strictly_before=True)
+
+    assert price == 999.0
+
+
 def test_n_trading_sessions_ago_skips_weekends():
     # 8 consecutive trading sessions (Mon-Thu, Mon-Thu), no weekend rows --
     # mirrors what yfinance actually returns, unlike a gapless calendar range.
@@ -176,7 +223,7 @@ def test_n_trading_sessions_ago_skips_weekends():
     hist = _hist_df(dates, closes)
 
     result_date, result_price = mft._n_trading_sessions_ago(
-        hist, 5, fallback_date=date(2000, 1, 1), fallback_price=-1.0
+        hist, hist, 5, fallback_date=date(2000, 1, 1), fallback_price=-1.0
     )
 
     # 5 sessions back from 2026-08-06 (the last row) is 2026-07-29, not the
@@ -189,11 +236,60 @@ def test_n_trading_sessions_ago_uses_fallback_when_not_enough_rows():
     hist = _hist_df(["2026-08-05", "2026-08-06"], [10.0, 11.0])
 
     result_date, result_price = mft._n_trading_sessions_ago(
-        hist, 5, fallback_date=date(2000, 1, 1), fallback_price=-1.0
+        hist, hist, 5, fallback_date=date(2000, 1, 1), fallback_price=-1.0
     )
 
     assert result_date == date(2000, 1, 1)
     assert result_price == -1.0
+
+
+def test_n_trading_sessions_ago_counts_interior_nan_gap_as_a_session():
+    # Real Yahoo behavior this regression test locks in: an *interior*
+    # session (2026-08-04, a Tuesday) comes back with a NaN close -- not the
+    # still-forming last bar, just a data gap -- while the sessions around
+    # it are fine. Counting positions against the NaN-dropped frame would
+    # silently skip that session, landing one day too far back (2026-07-29
+    # instead of 2026-07-30).
+    dates = [
+        "2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-31",
+        "2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06",
+    ]
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, float("nan"), 107.0, 108.0]
+    hist = _hist_df(dates, closes)
+    valid_hist = hist.dropna(subset=["Close"])
+
+    result_date, result_price = mft._n_trading_sessions_ago(
+        hist, valid_hist, 5, fallback_date=date(2000, 1, 1), fallback_price=-1.0
+    )
+
+    # 5 sessions back from 2026-08-06 is 2026-07-30 (103.0), counting
+    # 2026-08-04 as a real session despite its missing close.
+    assert result_date == date(2026, 7, 30)
+    assert result_price == 103.0
+
+
+def test_n_trading_sessions_ago_trims_only_trailing_nan_not_interior_ones():
+    # Combines both NaN cases: an interior gap (2026-08-04) plus a
+    # still-forming last bar (2026-08-07). The trailing NaN must be trimmed
+    # before counting positions, while the interior one still counts as a
+    # session.
+    dates = [
+        "2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-31",
+        "2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07",
+    ]
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, float("nan"), 107.0, 108.0, float("nan")]
+    hist = _hist_df(dates, closes)
+    valid_hist = hist.dropna(subset=["Close"])
+
+    result_date, result_price = mft._n_trading_sessions_ago(
+        hist, valid_hist, 4, fallback_date=date(2000, 1, 1), fallback_price=-1.0
+    )
+
+    # Trimming the trailing NaN (2026-08-07) leaves 2026-08-06 as the most
+    # recent session; 4 sessions back from there is 2026-07-31 (104.0),
+    # counting 2026-08-04's interior gap as one of those 4 sessions.
+    assert result_date == date(2026, 7, 31)
+    assert result_price == 104.0
 
 
 def test_last_intraday_close_returns_last_hourly_row_on_target_date():
@@ -219,6 +315,32 @@ def test_last_intraday_close_uses_fallback_when_empty():
     price = mft._last_intraday_close(pd.DataFrame(), date(2026, 8, 4), fallback=-1.0)
 
     assert price == -1.0
+
+
+def test_fetch_regular_market_previous_close_returns_value_on_success():
+    response = {"quoteResponse": {"result": [{"regularMarketPreviousClose": 128.72}]}}
+    ticker = _FakeTickerWithData(_FakeYfData(response=response))
+
+    assert mft._fetch_regular_market_previous_close(ticker, "SWDA.MI") == 128.72
+
+
+def test_fetch_regular_market_previous_close_returns_none_when_value_is_nan():
+    response = {"quoteResponse": {"result": [{"regularMarketPreviousClose": float("nan")}]}}
+    ticker = _FakeTickerWithData(_FakeYfData(response=response))
+
+    assert mft._fetch_regular_market_previous_close(ticker, "SWDA.MI") is None
+
+
+def test_fetch_regular_market_previous_close_returns_none_on_malformed_response():
+    ticker = _FakeTickerWithData(_FakeYfData(response={"quoteResponse": {"result": []}}))
+
+    assert mft._fetch_regular_market_previous_close(ticker, "SWDA.MI") is None
+
+
+def test_fetch_regular_market_previous_close_returns_none_on_request_failure():
+    ticker = _FakeTickerWithData(_FakeYfData(raise_exc=True))
+
+    assert mft._fetch_regular_market_previous_close(ticker, "SWDA.MI") is None
 
 
 def test_value_as_of_all_lots_held_uses_market_price():
@@ -248,12 +370,16 @@ def test_value_as_of_mixes_market_and_cost_priced_lots():
     assert value == 10 * 6.0 + 4 * 8.0
 
 
-def test_value_as_of_boundary_purchase_date_counts_as_held():
+def test_value_as_of_boundary_purchase_date_is_not_yet_held():
+    # target_date is a start-of-period anchor: a purchase landing exactly on
+    # it happened *during* the period being measured, not before it, so it
+    # must be priced at cost, not market -- confirmed against Yahoo's own
+    # portfolio baseline for this exact scenario.
     lots = [[10, 5.0, "2024-03-01"]]
 
     value = mft._value_as_of(lots, date(2024, 3, 1), market_price=6.0)
 
-    assert value == 10 * 6.0
+    assert value == 10 * 5.0
 
 
 def test_get_performance_happy_path_mixed_currencies(monkeypatch):
@@ -300,7 +426,7 @@ def test_get_performance_happy_path_mixed_currencies(monkeypatch):
     assert result == expected
 
 
-def test_get_performance_eurusd_fetch_failure_uses_fallback_rate(monkeypatch):
+def test_get_performance_eurusd_fetch_failure_uses_fallback_rate(monkeypatch, caplog):
     today = date.today()
     yesterday = today - timedelta(days=1)
     usd_hist = _hist_df([yesterday, today], [50.0, 60.0])
@@ -314,7 +440,10 @@ def test_get_performance_eurusd_fetch_failure_uses_fallback_rate(monkeypatch):
     )
     monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
 
-    result = mft.get_performance()
+    with caplog.at_level("WARNING"):
+        result = mft.get_performance()
+
+    assert "EUR/USD" in caplog.text
 
     fallback_rate = 0.92
     total_cost = 40.0
@@ -333,7 +462,7 @@ def test_get_performance_eurusd_fetch_failure_uses_fallback_rate(monkeypatch):
     assert result == expected
 
 
-def test_get_performance_skips_ticker_that_raises(monkeypatch):
+def test_get_performance_skips_ticker_that_raises(monkeypatch, caplog):
     today = date.today()
     yesterday = today - timedelta(days=1)
     good_hist = _hist_df([yesterday, today], [10.0, 12.0])
@@ -353,12 +482,14 @@ def test_get_performance_skips_ticker_that_raises(monkeypatch):
     )
     monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
 
-    result = mft.get_performance()
+    with caplog.at_level("WARNING"):
+        result = mft.get_performance()
 
     # BAD is skipped entirely: only GOOD contributes to the totals.
     expected = mft.format_performance(9.0, 12.0, 10.0, 10.0, 10.0, 10.0, 10.0)
 
     assert result == expected
+    assert "BAD" in caplog.text
 
 
 def test_get_performance_single_row_history_uses_current_price_as_prev_close(monkeypatch):
@@ -488,6 +619,46 @@ def test_get_performance_5d_counts_sessions_from_effective_today_when_last_close
     assert result == expected
 
 
+def test_get_performance_5d_counts_interior_nan_session_as_a_real_day(monkeypatch):
+    # Real Yahoo behavior this regression test locks in (see the keepna=True
+    # comment in get_performance): an *interior* trading session
+    # (2026-08-04, an ordinary Tuesday, not the still-forming last bar) can
+    # come back with a NaN close while the sessions around it are fine.
+    # Silently dropping that session from the count would land 5D's
+    # reference one day too far back (2026-07-29 instead of 2026-07-30).
+    dates = [
+        "2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-31",
+        "2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06",
+    ]
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, float("nan"), 107.0, 108.0]
+    hist = _hist_df(dates, closes)
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "NEW": {"fast_info": {"currency": "EUR"}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"NEW": [[1, 90.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    # Today's bar (2026-08-06, 108.0) is valid, so prev_close is the last
+    # valid close before it (2026-08-05, 107.0) -- 2026-08-04's NaN row is
+    # skipped for "last known close" purposes, same as before, but must
+    # still count as one of the 5 sessions for 5D's reference date.
+    expected = mft.format_performance(
+        total_cost=90.0,
+        current_total_value=108.0,
+        yesterday_total_value=107.0,
+        five_days_start_total_value=103.0,  # 2026-07-30
+        one_month_start_total_value=107.0,
+        ytd_start_total_value=107.0,
+        year_start_total_value=107.0,
+    )
+
+    assert result == expected
+
+
 def test_get_performance_skips_ticker_with_all_nan_history(monkeypatch):
     today = date.today()
     yesterday = today - timedelta(days=1)
@@ -545,7 +716,7 @@ def test_get_performance_multiple_lots_value_correctly_by_purchase_date(monkeypa
     current_price = hist["Close"].iloc[-1]
     prev_close = hist["Close"].iloc[-2]
     five_days_start_date, five_days_start_price = mft._n_trading_sessions_ago(
-        hist, 5, today - timedelta(days=5), prev_close
+        hist, hist, 5, today - timedelta(days=5), prev_close
     )
 
     expected = mft.format_performance(
@@ -554,13 +725,19 @@ def test_get_performance_multiple_lots_value_correctly_by_purchase_date(monkeypa
         yesterday_total_value=mft._value_as_of(lots, today - timedelta(days=1), prev_close),
         five_days_start_total_value=mft._value_as_of(lots, five_days_start_date, five_days_start_price),
         one_month_start_total_value=mft._value_as_of(
-            lots, today - timedelta(days=30), mft._closing_price_on_or_before(hist, today - timedelta(days=30), prev_close)
+            lots,
+            today - timedelta(days=30),
+            mft._closing_price_on_or_before(hist, today - timedelta(days=30), prev_close, strictly_before=True),
         ),
         ytd_start_total_value=mft._value_as_of(
-            lots, date(today.year - 1, 12, 31), mft._closing_price_on_or_before(hist, date(today.year - 1, 12, 31), prev_close)
+            lots,
+            date(today.year - 1, 12, 31),
+            mft._closing_price_on_or_before(hist, date(today.year - 1, 12, 31), prev_close, strictly_before=True),
         ),
         year_start_total_value=mft._value_as_of(
-            lots, today - timedelta(days=365), mft._closing_price_on_or_before(hist, today - timedelta(days=365), prev_close)
+            lots,
+            today - timedelta(days=365),
+            mft._closing_price_on_or_before(hist, today - timedelta(days=365), prev_close, strictly_before=True),
         ),
     )
 
@@ -572,13 +749,72 @@ def test_get_performance_multiple_lots_value_correctly_by_purchase_date(monkeypa
     assert mft._value_as_of(lots, five_days_ago, 77.0) == 77.0 + 90.0
 
 
+def test_get_performance_1m_excludes_lot_purchased_exactly_on_boundary_date(monkeypatch):
+    # Regression test for a real mismatch against Yahoo: a lot purchased
+    # exactly on the computed "1 month ago" reference date must not be
+    # priced at that date's market close as part of the 1M baseline -- it
+    # was bought *during* the period being measured, not before it. Before
+    # the fix, this inflated the 1M start value by (market_price - cost)
+    # per share, understating the reported 1M gain.
+    today = date.today()
+    one_month_ago = today - timedelta(days=30)
+
+    dates = [today - timedelta(days=offset) for offset in range(39, -1, -1)]
+    closes = [100.0 + i for i in range(len(dates))]
+    hist = _hist_df(dates, closes)
+
+    lots = [
+        [1, 50.0, _LONG_AGO],
+        [1, 77.0, one_month_ago.isoformat()],
+    ]
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "NEW": {"fast_info": {"currency": "EUR"}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"NEW": lots})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+
+    result = mft.get_performance()
+
+    current_price = hist["Close"].iloc[-1]
+    prev_close = hist["Close"].iloc[-2]
+    one_month_start_price = mft._closing_price_on_or_before(hist, one_month_ago, prev_close, strictly_before=True)
+    five_days_start_date, five_days_start_price = mft._n_trading_sessions_ago(
+        hist, hist, 5, today - timedelta(days=5), prev_close
+    )
+
+    expected = mft.format_performance(
+        total_cost=50.0 + 77.0,
+        # Today's live value counts the boundary lot in full, at market.
+        current_total_value=2 * current_price,
+        yesterday_total_value=mft._value_as_of(lots, today - timedelta(days=1), prev_close),
+        five_days_start_total_value=mft._value_as_of(lots, five_days_start_date, five_days_start_price),
+        # The boundary lot must be priced at its own cost (77.0) here, not
+        # one_month_start_price -- it's the exact scenario this fix covers.
+        one_month_start_total_value=1 * one_month_start_price + 1 * 77.0,
+        ytd_start_total_value=mft._value_as_of(
+            lots,
+            date(today.year - 1, 12, 31),
+            mft._closing_price_on_or_before(hist, date(today.year - 1, 12, 31), prev_close, strictly_before=True),
+        ),
+        year_start_total_value=mft._value_as_of(
+            lots,
+            today - timedelta(days=365),
+            mft._closing_price_on_or_before(hist, today - timedelta(days=365), prev_close, strictly_before=True),
+        ),
+    )
+
+    assert result == expected
+
+
 def test_get_performance_uses_hourly_price_to_refine_5d(monkeypatch):
     today = date.today()
     dates = [today - timedelta(days=offset) for offset in range(39, -1, -1)]
     closes = [100.0 + i for i in range(len(dates))]
     hist = _hist_df(dates, closes)
 
-    five_days_start_date, _ = mft._n_trading_sessions_ago(hist, 5, today - timedelta(days=5), 0.0)
+    five_days_start_date, _ = mft._n_trading_sessions_ago(hist, hist, 5, today - timedelta(days=5), 0.0)
     # The hourly close differs from the daily close on the 5D reference
     # date: get_performance should prefer this refined value.
     hourly_hist = _hist_df(
@@ -600,7 +836,7 @@ def test_get_performance_uses_hourly_price_to_refine_5d(monkeypatch):
     assert f"({current_price - expected_five_days_start_total_value:+.2f}€)" in result.split("5D: ")[1]
 
 
-def test_get_performance_hourly_history_failure_falls_back_to_daily_close(monkeypatch):
+def test_get_performance_hourly_history_failure_falls_back_to_daily_close(monkeypatch, caplog):
     today = date.today()
     yesterday = today - timedelta(days=1)
     hist = _hist_df([yesterday, today], [10.0, 12.0])
@@ -612,13 +848,62 @@ def test_get_performance_hourly_history_failure_falls_back_to_daily_close(monkey
     monkeypatch.setattr(mft, "load_portfolio", lambda: {"ONLY": [[1, 40.0, _LONG_AGO]]})
     monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
 
-    result = mft.get_performance()
+    with caplog.at_level("DEBUG"):
+        result = mft.get_performance()
 
     # Same expectation as the plain single-row-history case: the failed
     # hourly fetch falls back to the daily-close-derived price untouched.
     expected = mft.format_performance(40.0, 12.0, 10.0, 10.0, 10.0, 10.0, 10.0)
 
     assert result == expected
+    assert "ONLY" in caplog.text
+
+
+def test_get_performance_prefers_live_previous_close_over_chart_derived(monkeypatch):
+    # Chart-derived prev_close would be 10.0 (yesterday's daily close); the
+    # live quote endpoint's official close (11.5) must win instead, since
+    # it's what actually matches Yahoo's own Day Change figure.
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    hist = _hist_df([yesterday, today], [10.0, 12.0])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "LIVE": {"fast_info": {"currency": "EUR"}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"LIVE": [[1, 9.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+    monkeypatch.setattr(mft, "_fetch_regular_market_previous_close", lambda ticker, symbol: 11.5)
+
+    result = mft.get_performance()
+
+    # 5D/1M/YTD/1Y also fall back to prev_close here (history too short to
+    # cover those windows), so the live value flows through to all of them.
+    expected = mft.format_performance(9.0, 12.0, 11.5, 11.5, 11.5, 11.5, 11.5)
+
+    assert result == expected
+
+
+def test_get_performance_falls_back_to_chart_derived_previous_close_when_live_fetch_fails(monkeypatch, caplog):
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    hist = _hist_df([yesterday, today], [10.0, 12.0])
+
+    config = {
+        "EURUSD=X": {"fast_info": {"last_price": 1.0}},
+        "FALLBACK": {"fast_info": {"currency": "EUR"}, "history": hist},
+    }
+    monkeypatch.setattr(mft, "load_portfolio", lambda: {"FALLBACK": [[1, 9.0, _LONG_AGO]]})
+    monkeypatch.setattr(mft.yf, "Ticker", lambda symbol: _FakeTicker(symbol, config))
+    monkeypatch.setattr(mft, "_fetch_regular_market_previous_close", lambda ticker, symbol: None)
+
+    with caplog.at_level("DEBUG"):
+        result = mft.get_performance()
+
+    expected = mft.format_performance(9.0, 12.0, 10.0, 10.0, 10.0, 10.0, 10.0)
+
+    assert result == expected
+    assert "FALLBACK" in caplog.text
 
 
 def test_get_performance_empty_portfolio_returns_error_sentinel(monkeypatch):
